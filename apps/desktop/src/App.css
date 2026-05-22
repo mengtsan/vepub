@@ -1,0 +1,131 @@
+@import "tailwindcss";
+
+/* === 設計系統與主題變數 === */
+:root {
+  /* 預設為深色主題（OLED 友善純黑） */
+  --bg-primary:     #0f0f0f;    /* 主背景 */
+  --bg-surface:     #1a1a1a;    /* 卡片與面板背景 */
+  --bg-hover:       #242424;    /* hover 狀態 */
+
+  --text-primary:   #e8e6df;    /* 正文（米白，減少對比刺眼） */
+  --text-secondary: #8a8880;    /* 次要文字 */
+  --text-muted:     #4a4845;    /* 最弱文字 */
+
+  --accent:         #f59e0b;    /* Amber：高亮與播放中 */
+  --accent-dim:     rgba(245, 158, 11, 0.25); /* 高亮背景 */
+
+  --border:         rgba(255, 255, 255, 0.08);   /* 極細邊框 */
+  --border-focus:   rgba(255, 255, 255, 0.2);
+}
+
+.theme-light {
+  --bg-primary:     #fafaf8;
+  --bg-surface:     #ffffff;
+  --bg-hover:       #f0f0ed;
+  --text-primary:   #1a1917;
+  --text-secondary: #6b6966;
+  --text-muted:     #a3a19d;
+  --accent:         #d97706;
+  --accent-dim:     rgba(217, 119, 6, 0.15);
+  --border:         rgba(0, 0, 0, 0.08);
+  --border-focus:   rgba(0, 0, 0, 0.2);
+}
+
+.theme-paper {
+  --bg-primary:     #f4efe6;
+  --bg-surface:     #ede8de;
+  --bg-hover:       #e5decb;
+  --text-primary:   #2c2520;
+  --text-secondary: #706558;
+  --text-muted:     #a09382;
+  --accent:         #b45309;
+  --accent-dim:     rgba(180, 83, 9, 0.15);
+  --border:         rgba(44, 37, 32, 0.08);
+  --border-focus:   rgba(44, 37, 32, 0.2);
+}
+
+/* === 全域基礎樣式 === */
+body {
+  margin: 0;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: -apple-system, "SF Pro Text", "Noto Sans TC", sans-serif;
+  transition: background-color 300ms ease, color 300ms ease;
+  overflow-x: hidden;
+}
+
+/* === 朗讀句子高亮樣式 === */
+.tts-highlight {
+  background-color: var(--accent-dim) !important;
+  border-bottom: 2px solid var(--accent) !important;
+  transition: background-color 150ms ease-out;
+}
+
+/* === 閱讀頁面正文排版 === */
+.reader-content {
+  max-width: 680px;
+  margin: 0 auto;
+  line-height: var(--line-height, 1.7);
+  font-size: var(--font-size, 18px);
+}
+
+.reader-content.font-sans {
+  font-family: "Noto Sans TC", "Source Han Sans", sans-serif;
+}
+
+.reader-content.font-serif {
+  font-family: "Noto Serif TC", "Source Han Serif", serif;
+}
+
+/* === 自訂捲動條美化（深色友好） === */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--bg-hover);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* === 懸浮播放控制膠囊 (PlayerBar) === */
+.player-bar {
+  position: fixed;
+  bottom: 2rem;
+  left: 50%;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  padding: 0.75rem 1.5rem;
+  border-radius: 9999px;
+  background-color: rgba(26, 26, 26, 0.75); /* OLED 友善純黑毛玻璃 */
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.5), 0 8px 10px -6px rgb(0 0 0 / 0.5);
+  max-width: 90vw;
+  width: max-content;
+}
+
+/* 主題適配 */
+.theme-light .player-bar {
+  background-color: rgba(255, 255, 255, 0.75);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
+}
+
+.theme-paper .player-bar {
+  background-color: rgba(237, 232, 222, 0.75);
+  border: 1px solid rgba(44, 37, 32, 0.08);
+  box-shadow: 0 20px 25px -5px rgb(44 37 32 / 0.15), 0 8px 10px -6px rgb(44 37 32 / 0.15);
+}
+
