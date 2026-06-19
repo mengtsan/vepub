@@ -53,6 +53,40 @@ class EpubParser:
     def __init__(self, filepath: str):
         self.book = epub.read_epub(filepath)
 
+    def _find_cover_item(self):
+        """多路徑封面偵測：cover-image ID → OPF meta → properties → 檔名啟發式。"""
+        # 1. 標準 EPUB id: cover-image
+        item = self.book.get_item_with_id("cover-image")
+        if item and item.get_content():
+            return item
+
+        # 2. EPUB2 <meta name="cover" content="..."> 指向的 item id
+        for ns_dict in self.book.metadata.values():
+            for values in ns_dict.values():
+                for _val, attrs in values:
+                    if isinstance(attrs, dict) and attrs.get("name", "").lower() == "cover":
+                        cover_id = attrs.get("content", "")
+                        if cover_id:
+                            ci = self.book.get_item_with_id(cover_id)
+                            if ci and ci.get_content():
+                                return ci
+
+        # 3. EPUB3 properties="cover-image"
+        for img_item in self.book.get_items_of_type(ebooklib.ITEM_IMAGE):
+            props = getattr(img_item, "properties", None) or []
+            if isinstance(props, str):
+                props = props.split()
+            if "cover-image" in props and img_item.get_content():
+                return img_item
+
+        # 4. 檔名啟發式（cover.jpg / cover.png / ...）
+        for img_item in self.book.get_items_of_type(ebooklib.ITEM_IMAGE):
+            fname = os.path.basename(getattr(img_item, "file_name", "") or "").lower()
+            if fname.startswith("cover") and img_item.get_content():
+                return img_item
+
+        return None
+
     def get_meta(self) -> BookMeta:
         """
         取得書籍中繼資料與封面圖片。
@@ -63,11 +97,9 @@ class EpubParser:
 
         cover_base64 = None
         try:
-            cover_item = self.book.get_item_with_id("cover-image")
+            cover_item = self._find_cover_item()
             if cover_item:
-                cover_base64 = base64.b64encode(
-                    cover_item.get_content()
-                ).decode()
+                cover_base64 = base64.b64encode(cover_item.get_content()).decode()
         except Exception:
             pass
 
@@ -93,23 +125,24 @@ class EpubParser:
         ignore_tags = {"script", "style", "head", "title", "meta", "link"}
 
         for order, item in enumerate(spine_items):
-            soup = BeautifulSoup(item.get_content(), "lxml")
+            # 使用 html.parser（Python 內建，無 lxml XMLParsedAsHTMLWarning）
+            soup = BeautifulSoup(item.get_content(), "html.parser")
 
             paragraphs = []
             current_para = []
 
             def walk(node):
                 from bs4 import NavigableString
-                
+
                 if node.name in ignore_tags:
                     return
-                    
+
                 if isinstance(node, NavigableString):
                     txt = str(node).strip()
                     if txt:
                         current_para.append(txt)
                     return
-                
+
                 # 處理 br 標籤換行，避免文字黏黏在一起
                 if node.name == "br":
                     if current_para and not current_para[-1].endswith(" "):
@@ -117,16 +150,16 @@ class EpubParser:
                     return
 
                 is_block = node.name in block_tags
-                
+
                 if is_block:
                     # 進入 block 元素前，若當前有累積的文字，先存為段落
                     if current_para:
                         paragraphs.append("".join(current_para))
                         current_para.clear()
-                        
+
                 for child in node.children:
                     walk(child)
-                    
+
                 if is_block:
                     # 離開 block 元素時，若當前有累積的文字，存為段落
                     if current_para:
@@ -136,11 +169,11 @@ class EpubParser:
             body_tag = soup.find("body")
             if body_tag:
                 walk(body_tag)
-                
+
             # 最後保底處理
             if current_para:
                 paragraphs.append("".join(current_para))
-                
+
             # 清理段落中多餘的空白並過濾空段落
             paragraphs = [p.strip() for p in paragraphs if p.strip()]
 
@@ -149,8 +182,8 @@ class EpubParser:
 
             # 1. 優先從 Flat TOC 中匹配
             for href, toc_title in flat_toc.items():
-                if (href.endswith(item.file_name) or 
-                    item.file_name.endswith(href) or 
+                if (href.endswith(item.file_name) or
+                    item.file_name.endswith(href) or
                     os.path.basename(href) == os.path.basename(item.file_name)):
                     title = toc_title
                     break
@@ -215,3 +248,38 @@ class EpubParser:
         if values:
             return values[0][0]
         return None
+
+
+# ─── 模組級快取（支援單鍵失效，替代 functools.lru_cache 的 cache_clear()） ───────
+
+_MAX_CACHED_BOOKS = 16
+_chapters_cache: dict[str, list[Chapter]] = {}
+_meta_cache: dict[str, BookMeta] = {}
+
+
+def _trim(cache: dict) -> None:
+    """超過上限時踢除最舊的 entry（Python 3.7+ dict 插入有序）。"""
+    while len(cache) >= _MAX_CACHED_BOOKS:
+        cache.pop(next(iter(cache)))
+
+
+def get_chapters_cached(filepath: str) -> list[Chapter]:
+    """對外介面：取得快取的章節清單（快取同路徑結果，最多 16 本）。"""
+    if filepath not in _chapters_cache:
+        _trim(_chapters_cache)
+        _chapters_cache[filepath] = EpubParser(filepath).get_chapters()
+    return _chapters_cache[filepath]
+
+
+def get_meta_cached(filepath: str) -> BookMeta:
+    """對外介面：取得快取的書籍 metadata（快取同路徑結果，最多 16 本）。"""
+    if filepath not in _meta_cache:
+        _trim(_meta_cache)
+        _meta_cache[filepath] = EpubParser(filepath).get_meta()
+    return _meta_cache[filepath]
+
+
+def invalidate_cache(filepath: str) -> None:
+    """書籍被刪除時呼叫，只清除該書的快取（不影響其他書）。"""
+    _chapters_cache.pop(filepath, None)
+    _meta_cache.pop(filepath, None)

@@ -8,6 +8,24 @@
 """
 import re
 from dataclasses import dataclass
+from typing import Any
+
+# 快取硬體偵測結果，避免每次 TextChunker 初始化都重新跑一次
+_hw_max_chars: int | None = None
+
+# 模組級 spaCy 模型快取，key = 語言前綴（"zh"/"en"/"ja"）
+_nlp_cache: dict[str, Any] = {}
+
+def _get_hw_max_chars() -> int:
+    global _hw_max_chars
+    if _hw_max_chars is None:
+        try:
+            from services.hardware_detector import detect_hardware
+            hw = detect_hardware()
+            _hw_max_chars = 35 if hw.get("recommended_device") == "cpu" else 80
+        except Exception:
+            _hw_max_chars = 35
+    return _hw_max_chars
 
 @dataclass
 class Sentence:
@@ -29,40 +47,28 @@ class TextChunker:
         if max_chars is not None:
             self.max_chars = max_chars
         else:
-            try:
-                from services.hardware_detector import detect_hardware
-                hw = detect_hardware()
-                if hw.get("recommended_device") == "cpu":
-                    self.max_chars = 35  # CPU 模式下限制在 35 字，使單句推理縮減到 10 ~ 15 秒內
-                else:
-                    self.max_chars = 80  # GPU/MLX 模式下使用較長句子
-            except Exception:
-                self.max_chars = 35  # 發生異常時保險起見使用 35 字
+            self.max_chars = _get_hw_max_chars()
 
 
     def _load_nlp(self, language: str):
-        """
-        依語言載入 spaCy 模型。
-        """
-        if language.startswith("zh"):
-            import spacy
-            try:
-                return spacy.load("zh_core_web_sm")
-            except Exception:
-                return None
-        elif language.startswith("ja"):
-            import spacy
-            try:
-                return spacy.load("ja_core_news_sm")
-            except Exception:
-                return None
-        elif language.startswith("en"):
-            import spacy
-            try:
-                return spacy.load("en_core_web_sm")
-            except Exception:
-                return None
-        return None
+        """依語言載入 spaCy 模型，結果快取於模組級 dict 避免重複載入。"""
+        _MODEL_MAP = {
+            "zh": "zh_core_web_sm",
+            "ja": "ja_core_news_sm",
+            "en": "en_core_web_sm",
+        }
+        lang_key = next((k for k in _MODEL_MAP if language.startswith(k)), None)
+        if lang_key is None:
+            return None
+        if lang_key in _nlp_cache:
+            return _nlp_cache[lang_key]
+        import spacy
+        try:
+            nlp = spacy.load(_MODEL_MAP[lang_key])
+        except Exception:
+            nlp = None
+        _nlp_cache[lang_key] = nlp
+        return nlp
 
     def chunk_paragraphs(
         self, paragraphs: list[str]

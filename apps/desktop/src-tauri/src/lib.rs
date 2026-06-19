@@ -1,93 +1,155 @@
-use std::process::{Command, Child, Stdio};
-use std::sync::Mutex;
-use tauri::{Builder, Manager, RunEvent};
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+use tauri::{Manager, RunEvent};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-// 儲存 Python 背景進程的 State
+// ─── Windows Job Object ───────────────────────────────────────────────────────
+// Holds a Win32 Job Object handle. When dropped (= Tauri exits), the OS kills
+// every process assigned to the job, including the sidecar and llama-server.exe.
+
+#[cfg(target_os = "windows")]
+struct WinJob(windows::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for WinJob {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for WinJob {}
+
+#[cfg(target_os = "windows")]
+impl Drop for WinJob {
+    fn drop(&mut self) {
+        unsafe { let _ = windows::Win32::Foundation::CloseHandle(self.0); }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn create_kill_on_close_job() -> Option<WinJob> {
+    use windows::Win32::System::JobObjects::{
+        CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    unsafe {
+        let job = CreateJobObjectW(None, None).ok()?;
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .ok()?;
+        Some(WinJob(job))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn assign_to_job(job: &WinJob, child: &Child) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+    let h = HANDLE(child.as_raw_handle() as *mut core::ffi::c_void);
+    unsafe { AssignProcessToJobObject(job.0, h).is_ok() }
+}
+
+// ─── Managed state ───────────────────────────────────────────────────────────
+
 struct BackendState {
     child: Mutex<Option<Child>>,
+    #[cfg(target_os = "windows")]
+    _job: Option<WinJob>,
 }
 
-// 啟動背景 Python 後端服務
-fn start_backend() -> Option<Child> {
-    // 預設尋找本地 .venv 的 Python 解譯器
-    let mut python_path = PathBuf::from("backend/.venv/Scripts/python.exe");
-    if !python_path.exists() {
-        // 備用：若找不到，尋找類 Unix 或系統全域 python
-        python_path = PathBuf::from("backend/.venv/bin/python");
-        if !python_path.exists() {
-            python_path = PathBuf::from("python");
-        }
-    }
+// ─── Production-only sidecar launch ──────────────────────────────────────────
+// In dev mode the backend is managed by `concurrently` (npm run dev),
+// so we skip spawning it here entirely.
 
-    let main_py = PathBuf::from("backend/main.py");
-    if !main_py.exists() {
-        eprintln!("找不到 backend/main.py，無法啟動背景後端");
-        return None;
-    }
+#[cfg(not(dev))]
+fn find_sidecar_exe(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let res = app.path().resource_dir().ok()?;
+    let exe = res.join("vepub-backend").join("vepub-backend.exe");
+    if exe.exists() { Some(exe) } else { None }
+}
 
-    println!("正在啟動 Python 後端：{:?} {:?}", python_path, main_py);
-
-    let mut cmd = Command::new(python_path);
-    cmd.arg(main_py)
-       .stdout(Stdio::piped())
-       .stderr(Stdio::piped());
-
-    // 在 Windows 上隱藏黑色命令提示字元視窗
+#[cfg(not(dev))]
+fn start_backend(app: &tauri::AppHandle) -> BackendState {
     #[cfg(target_os = "windows")]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    let job = create_kill_on_close_job();
 
-    match cmd.spawn() {
-        Ok(child) => {
-            println!("Python 後端啟動成功，PID: {}", child.id());
-            Some(child)
+    let child = match find_sidecar_exe(app) {
+        Some(exe) => {
+            println!("[vepub] sidecar: {:?}", exe);
+            let mut cmd = Command::new(&exe);
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+            #[cfg(target_os = "windows")]
+            cmd.creation_flags(0x08000000 /* CREATE_NO_WINDOW */);
+
+            match cmd.spawn() {
+                Ok(child) => {
+                    println!("[vepub] sidecar PID {}", child.id());
+                    #[cfg(target_os = "windows")]
+                    if let Some(ref j) = job {
+                        if assign_to_job(j, &child) {
+                            println!("[vepub] assigned to Job Object");
+                        }
+                    }
+                    Some(child)
+                }
+                Err(e) => {
+                    eprintln!("[vepub] sidecar spawn 失敗: {e}");
+                    None
+                }
+            }
         }
-        Err(e) => {
-            eprintln!("啟動 Python 後端失敗: {}", e);
+        None => {
+            eprintln!("[vepub] 找不到 sidecar，請先執行 PyInstaller 打包後端");
             None
         }
+    };
+
+    BackendState {
+        child: Mutex::new(child),
+        #[cfg(target_os = "windows")]
+        _job: job,
     }
 }
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+// ─── Entry point ─────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![])
         .setup(|app| {
-            // 在 Tauri 啟動時自動跑起 FastAPI 後端
-            let child = start_backend();
-            app.manage(BackendState {
-                child: Mutex::new(child),
-            });
+            // Production only: spawn the sidecar.
+            // Dev mode: backend is already running via `npm run dev`.
+            #[cfg(not(dev))]
+            {
+                let state = start_backend(app.handle());
+                app.manage(state);
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while running tauri application");
 
-    app.run(|app_handle, event| match event {
-        RunEvent::Exit => {
-            // 當桌面程式關閉時，安全釋放並 Kill 掉 Python 進程，避免殘留
-            if let Some(state) = app_handle.try_state::<BackendState>() {
+    app.run(|handle, event| {
+        if let RunEvent::Exit = event {
+            #[cfg(not(dev))]
+            if let Some(state) = handle.try_state::<BackendState>() {
                 let mut lock = state.child.lock().unwrap();
                 if let Some(mut child) = lock.take() {
-                    println!("正在終止 Python 後端進程 (PID: {})...", child.id());
+                    println!("[vepub] kill sidecar PID {}…", child.id());
                     let _ = child.kill();
+                    let _ = child.wait();
                 }
+                // _job drops here → OS kills entire process tree
             }
         }
-        _ => {}
     });
 }

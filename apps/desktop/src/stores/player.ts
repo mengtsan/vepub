@@ -67,7 +67,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   refAudioPath: "",
   refText: "",
   instruct: "",
-  numStep: 32,
+  numStep: 16,
   duration: null,
 
   play: () => set({ isPlaying: true }),

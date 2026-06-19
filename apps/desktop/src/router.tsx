@@ -2,6 +2,8 @@ import { createRootRoute, createRoute, createRouter } from "@tanstack/react-rout
 import App from "./App";
 import Library from "@/pages/Library";
 import Reader from "@/pages/Reader";
+import IllustrationTest from "@/pages/IllustrationTest";
+import ModelManager from "@/pages/ModelManager";
 
 // 建立根路由（Root Route），做為所有子頁面的外層容器
 const rootRoute = createRootRoute({
@@ -22,8 +24,22 @@ const readerRoute = createRoute({
   component: Reader,
 });
 
+// 插圖測試頁路由
+const illustrationTestRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/illustration-test",
+  component: IllustrationTest,
+});
+
+// 模型管理頁路由
+const modelManagerRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/models",
+  component: ModelManager,
+});
+
 // 組合路由樹
-const routeTree = rootRoute.addChildren([indexRoute, readerRoute]);
+const routeTree = rootRoute.addChildren([indexRoute, readerRoute, illustrationTestRoute, modelManagerRoute]);
 
 // 建立 Router 實例
 export const router = createRouter({ routeTree });

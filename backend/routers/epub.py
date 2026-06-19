@@ -9,15 +9,20 @@ POST /epub/{book_id}/progress → 儲存該書的閱讀進度
 GET  /epub/settings          → 取得使用者設定
 POST /epub/settings          → 儲存使用者設定
 """
-from fastapi import APIRouter, UploadFile, File, HTTPException, Body
-from services.epub_parser import EpubParser
-from services.text_chunker import TextChunker
-from services.db import get_db_connection, DB_DIR
+import asyncio
+import hashlib
+import logging
 import os
 import uuid
+
+logger = logging.getLogger(__name__)
 import shutil
 from pathlib import Path
 from pydantic import BaseModel
+from fastapi import APIRouter, UploadFile, File, HTTPException, Body
+from services.epub_parser import EpubParser, get_chapters_cached, get_meta_cached, invalidate_cache
+from services.text_chunker import TextChunker
+from services.db import get_db_connection, DB_DIR
 
 router = APIRouter()
 
@@ -34,29 +39,64 @@ class ProgressUpdate(BaseModel):
 async def parse_epub(file: UploadFile = File(...)):
     """
     解析上傳的 EPUB 檔案，並儲存至本地目錄與資料庫中。
+    若同一檔案已匯入（依 sha256 去重），直接回傳既有書籍資料。
     """
+    file_bytes = await file.read()
+    file_hash = hashlib.sha256(file_bytes).hexdigest()[:32]
+
+    # 去重查詢：同一檔案已匯入則直接回傳
+    conn = get_db_connection()
+    dup = conn.execute(
+        "SELECT id, title, author, language, cover_base64, chapter_count, file_path FROM books WHERE file_hash=?",
+        (file_hash,)
+    ).fetchone()
+    conn.close()
+
+    if dup:
+        loop = asyncio.get_running_loop()
+        try:
+            chapters = await loop.run_in_executor(None, get_chapters_cached, dup["file_path"])
+        except Exception:
+            chapters = []
+        return {
+            "book_id": dup["id"],
+            "duplicate": True,
+            "meta": {
+                "title": dup["title"],
+                "author": dup["author"],
+                "language": dup["language"],
+                "cover_base64": dup["cover_base64"],
+                "chapter_count": dup["chapter_count"],
+            },
+            "chapters": [
+                {"id": ch.id, "title": ch.title, "order": ch.order, "paragraph_count": len(ch.paragraphs)}
+                for ch in chapters
+            ],
+        }
+
     book_id = str(uuid.uuid4())
     save_path = BOOKS_DIR / f"{book_id}.epub"
 
-    # 儲存上傳的檔案
+    # 儲存上傳的檔案（在 executor 執行，避免大檔寫入阻塞 event loop）
     try:
-        with open(save_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, save_path.write_bytes, file_bytes)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"儲存電子書檔案失敗: {str(e)}")
 
     try:
-        parser = EpubParser(str(save_path))
-        meta = parser.get_meta()
-        chapters = parser.get_chapters()
+        # 在 thread pool 執行同步的 EPUB 解析，避免阻塞 event loop
+        loop = asyncio.get_running_loop()
+        meta = await loop.run_in_executor(None, get_meta_cached, str(save_path))
+        chapters = await loop.run_in_executor(None, get_chapters_cached, str(save_path))
 
         # 將書籍元資料寫入資料庫
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO books (id, title, author, language, cover_base64, file_path, chapter_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO books (id, title, author, language, cover_base64, file_path, chapter_count, file_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 book_id,
@@ -65,7 +105,8 @@ async def parse_epub(file: UploadFile = File(...)):
                 meta.language,
                 meta.cover_base64,
                 str(save_path),
-                meta.chapter_count
+                meta.chapter_count,
+                file_hash,
             )
         )
         # 初始化預設進度
@@ -94,13 +135,6 @@ async def parse_epub(file: UploadFile = File(...)):
                 }
                 for ch in chapters
             ],
-            "_chapters_data": [
-                {
-                    "id": ch.id,
-                    "paragraphs": ch.paragraphs
-                }
-                for ch in chapters
-            ]
         }
     except Exception as e:
         # 發生錯誤時清理已儲存的檔案
@@ -155,13 +189,13 @@ async def delete_book(book_id: str):
     finally:
         conn.close()
 
-    # 刪除實體檔案
+    # 刪除實體檔案並清除快取
     if os.path.exists(file_path):
         try:
+            invalidate_cache(file_path)
             os.unlink(file_path)
         except Exception as e:
-            # 實體檔案刪除失敗僅作警告，不阻斷 API 回傳
-            print(f"警告：刪除實體檔案失敗 ({file_path}): {str(e)}")
+            logger.warning("刪除實體檔案失敗 (%s): %s", file_path, e)
 
     return {"status": "success", "message": "書籍已成功刪除"}
 
@@ -177,10 +211,10 @@ async def get_book_chapters(book_id: str):
     conn.close()
     if not row:
         raise HTTPException(status_code=404, detail="找不到該書籍")
-    
+
     try:
-        parser = EpubParser(row["file_path"])
-        chapters = parser.get_chapters()
+        loop = asyncio.get_running_loop()
+        chapters = await loop.run_in_executor(None, get_chapters_cached, row["file_path"])
         return [
             {
                 "id": ch.id,
@@ -205,11 +239,11 @@ async def get_chapter_paragraphs(book_id: str, chapter_id: str):
     conn.close()
     if not row:
         raise HTTPException(status_code=404, detail="找不到該書籍")
-    
+
     try:
-        parser = EpubParser(row["file_path"])
-        chapters = parser.get_chapters()
-        
+        loop = asyncio.get_running_loop()
+        chapters = await loop.run_in_executor(None, get_chapters_cached, row["file_path"])
+
         # 優先以 ID 進行匹配
         for ch in chapters:
             if ch.id == chapter_id:
@@ -224,6 +258,8 @@ async def get_chapter_paragraphs(book_id: str, chapter_id: str):
             pass
             
         raise HTTPException(status_code=404, detail="找不到指定章節")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"讀取章節段落失敗: {str(e)}")
 
@@ -237,8 +273,11 @@ async def get_sentences(
     """
     將段落列表切割為句子列表。
     """
-    chunker = TextChunker(language=language)
-    sentences = chunker.chunk_paragraphs(paragraphs)
+    loop = asyncio.get_running_loop()
+    def _chunk():
+        chunker = TextChunker(language=language)
+        return chunker.chunk_paragraphs(paragraphs)
+    sentences = await loop.run_in_executor(None, _chunk)
     return {
         "sentences": [
             {
@@ -293,6 +332,48 @@ async def save_progress(book_id: str, progress: ProgressUpdate):
     conn.close()
     return {"status": "success"}
 
+class BookmarkCreate(BaseModel):
+    chapter_index: int
+    sentence_index: int
+    note: str = ""
+
+@router.get("/{book_id}/bookmarks")
+async def get_bookmarks(book_id: str):
+    """取得指定書籍的所有書籤。"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, chapter_index, sentence_index, note, created_at FROM bookmarks WHERE book_id = ? ORDER BY created_at DESC",
+        (book_id,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+@router.post("/{book_id}/bookmarks")
+async def create_bookmark(book_id: str, bm: BookmarkCreate):
+    """新增書籤。"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO bookmarks (book_id, chapter_index, sentence_index, note) VALUES (?, ?, ?, ?)",
+        (book_id, bm.chapter_index, bm.sentence_index, bm.note)
+    )
+    bm_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return {"id": bm_id, "status": "success"}
+
+@router.delete("/{book_id}/bookmarks/{bookmark_id}")
+async def delete_bookmark(book_id: str, bookmark_id: int):
+    """刪除書籤。"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM bookmarks WHERE id = ? AND book_id = ?", (bookmark_id, book_id))
+    conn.commit()
+    conn.close()
+    return {"status": "success"}
+
 @router.get("/settings")
 async def get_settings():
     """
@@ -322,4 +403,18 @@ async def update_settings(settings: dict = Body(...)):
         )
     conn.commit()
     conn.close()
+
+    # 同步更新插圖引擎的 in-memory 設定
+    illus_patch: dict = {}
+    if "illustration_prompt_prefix" in settings:
+        illus_patch["prompt_prefix"] = str(settings["illustration_prompt_prefix"])
+    if "illustration_negative_prompt" in settings:
+        illus_patch["negative_prompt"] = str(settings["illustration_negative_prompt"])
+    if illus_patch:
+        try:
+            from services.illustration.settings import update_settings as _update_illus
+            _update_illus(illus_patch)
+        except Exception:
+            pass
+
     return {"status": "success"}

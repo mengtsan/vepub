@@ -1,19 +1,13 @@
-import { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef } from "react";
+import { toast } from "sonner";
 import { useReaderStore } from "@/stores/reader";
 import { usePlayerStore } from "@/stores/player";
+import { getIllustrationSettings, patchIllustrationSettings, saveSettings, listLoras, LoraInfo } from "@/lib/api";
 import {
-  X, Sliders, Type, Volume2, HardDrive, Trash2,
-  Download, Cpu, Mic, Wand2, Bot, ChevronDown, ChevronUp,
-  Loader2, CheckCircle2, UploadCloud
+  X, Sliders, Type, Volume2, HardDrive,
+  Mic, Wand2, Bot, ChevronDown, ChevronUp,
+  Loader2, CheckCircle2, UploadCloud, ImagePlus
 } from "lucide-react";
-import {
-  ModelStatus,
-  getModelsStatus,
-  downloadModel,
-  deleteModel,
-  loadModel,
-  unloadModel,
-} from "@/lib/api";
 import { TTSMode } from "@/stores/player";
 
 interface SettingsPanelProps {
@@ -21,17 +15,39 @@ interface SettingsPanelProps {
   onClose: () => void;
 }
 
+// 預設繪圖風格前綴：label 顯示於 UI，value 為實際附加到 prompt 最前面的英文修飾詞
+const STYLE_PRESETS: { label: string; value: string }[] = [
+  { label: "動漫",     value: "anime style, vibrant colors, clean lineart, highly detailed" },
+  { label: "插畫厚塗", value: "digital painting, painterly, soft cinematic lighting, concept art" },
+  { label: "水彩",     value: "watercolor painting, soft washes, delicate, artistic" },
+  { label: "吉卜力",   value: "studio ghibli style, soft colors, hand-drawn, whimsical, dreamy" },
+  { label: "油畫",     value: "oil painting, thick brush strokes, classical, rich texture" },
+  { label: "寫實",     value: "photorealistic, cinematic lighting, ultra-detailed, realistic" },
+  { label: "賽博龐克", value: "cyberpunk, neon lights, futuristic, high contrast, atmospheric" },
+  { label: "素描",     value: "pencil sketch, monochrome, detailed linework, hand-drawn" },
+];
+
 export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
   const {
     theme,
     fontSize,
     fontFamily,
     lineHeight,
+    volume,
     hardwareInfo,
     setTheme,
     setFontSize,
     setFontFamily,
     setLineHeight,
+    setVolume,
+    illustrationPromptPrefix,
+    illustrationWidth,
+    illustrationHeight,
+    illustrationSeed,
+    setIllustrationPromptPrefix,
+    setIllustrationWidth,
+    setIllustrationHeight,
+    setIllustrationSeed,
   } = useReaderStore();
 
   const {
@@ -51,96 +67,90 @@ export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
     setDuration,
   } = usePlayerStore();
 
-  const [models, setModels] = useState<ModelStatus[]>([]);
-  const [loadingModels, setLoadingModels] = useState(false);
-  const [modelActionLoading, setModelActionLoading] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [negativePrompt, setNegativePrompt] = useState("");
+  const negSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const fetchModels = async (showLoading = false) => {
-    if (showLoading) setLoadingModels(true);
-    try {
-      const data = await getModelsStatus();
-      setModels(data);
-    } catch (err) {
-      console.error("載入模型列表失敗:", err);
-    } finally {
-      if (showLoading) setLoadingModels(false);
-    }
-  };
+  // 生圖參數（與後端同步）
+  const [illSteps,         setIllSteps]         = useState(30);
+  const [illCfg,           setIllCfg]           = useState(6.0);
+  const [hiresEnabled,     setHiresEnabled]     = useState(false);
+  const [hiresDenoise,     setHiresDenoise]     = useState(0.35);
+  const [adetailerEnabled, setAdetailerEnabled] = useState(true);
+  const [adetailerDenoise, setAdetailerDenoise] = useState(0.4);
+  const illSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // LoRA 管理
+  const [availableLoras, setAvailableLoras] = useState<LoraInfo[]>([]);
+  const [activeLoras, setActiveLoras] = useState<{ filename: string; weight: number; enabled: boolean }[]>([]);
+
+  // 開啟面板時載入所有插圖設定
   useEffect(() => {
-    if (isOpen) {
-      fetchModels(true);
-    }
+    if (!isOpen) return;
+    getIllustrationSettings().then(s => {
+      setNegativePrompt(s.negative_prompt);
+      setIllSteps(s.steps ?? 30);
+      setIllCfg(s.guidance_scale ?? 6.0);
+      setHiresEnabled(s.hires_fix_enabled ?? false);
+      setHiresDenoise(s.hires_denoise ?? 0.35);
+      setAdetailerEnabled(s.adetailer_enabled ?? true);
+      setAdetailerDenoise(s.adetailer_denoise ?? 0.4);
+      setActiveLoras(s.active_loras ?? []);
+    }).catch(() => {});
+    listLoras().then(setAvailableLoras).catch(() => {});
   }, [isOpen]);
 
-  // 下載中時每 1.5 秒輪詢進度
-  useEffect(() => {
-    let timer: NodeJS.Timeout | null = null;
-    const hasDownloading = models.some((m) => m.status === "downloading");
-
-    if (hasDownloading && isOpen) {
-      timer = setInterval(() => {
-        fetchModels();
-      }, 1500);
-    }
-
-    return () => {
-      if (timer) clearInterval(timer);
-    };
-  }, [models, isOpen]);
-
-  const handleDownload = async (modelId: string) => {
-    try {
-      setModelActionLoading(modelId + "_download");
-      await downloadModel(modelId);
-      fetchModels();
-    } catch (err: any) {
-      alert(`啟動下載失敗: ${err.message}`);
-    } finally {
-      setModelActionLoading(null);
-    }
+  const updateLoras = (updated: typeof activeLoras) => {
+    setActiveLoras(updated);
+    patchIllustrationSettings({ active_loras: updated }).catch(() => toast.error("儲存 LoRA 設定失敗"));
   };
 
-  const handleLoad = async (modelId: string) => {
-    if (!confirm(`確定要將「${modelId}」載入至 TTS 引擎嗎？\n這需要一些時間，載入期間 TTS 無法使用。`)) return;
-    try {
-      setModelActionLoading(modelId + "_load");
-      await loadModel(modelId);
-      await fetchModels();
-    } catch (err: any) {
-      alert(`載入模型失敗: ${err.message}`);
-    } finally {
-      setModelActionLoading(null);
+  const toggleLora = (filename: string) => {
+    const existing = activeLoras.find(l => l.filename === filename);
+    let updated: typeof activeLoras;
+    if (existing) {
+      updated = activeLoras.map(l =>
+        l.filename === filename ? { ...l, enabled: !l.enabled } : l
+      );
+    } else {
+      updated = [...activeLoras, { filename, weight: 1.0, enabled: true }];
     }
+    updateLoras(updated);
   };
 
-  const handleUnload = async (modelId: string) => {
-    if (!confirm("確定要從記憶體中卸載此模型嗎？\n卸載後 TTS 將無法運作，需重新載入才能繼續使用。")) return;
-    try {
-      setModelActionLoading(modelId + "_unload");
-      await unloadModel();
-      await fetchModels();
-    } catch (err: any) {
-      alert(`卸載模型失敗: ${err.message}`);
-    } finally {
-      setModelActionLoading(null);
-    }
+  const setLoraWeight = (filename: string, weight: number) => {
+    const exists = activeLoras.some(l => l.filename === filename);
+    const updated = exists
+      ? activeLoras.map(l => l.filename === filename ? { ...l, weight } : l)
+      : [...activeLoras, { filename, weight, enabled: true }];
+    updateLoras(updated);
   };
 
-  const handleDelete = async (modelId: string) => {
-    if (!confirm("確定要刪除此模型檔案嗎？\n若模型正在下載中，將自動取消下載。")) return;
-    try {
-      setModelActionLoading(modelId + "_delete");
-      await deleteModel(modelId);
-      await fetchModels();
-    } catch (err: any) {
-      alert(`刪除模型失敗: ${err.message}`);
-    } finally {
-      setModelActionLoading(null);
-    }
+  const getLoraState = (filename: string) =>
+    activeLoras.find(l => l.filename === filename) ?? { enabled: false, weight: 1.0 };
+
+  const patchIll = (patch: Parameters<typeof patchIllustrationSettings>[0]) => {
+    if (illSaveTimerRef.current) clearTimeout(illSaveTimerRef.current);
+    illSaveTimerRef.current = setTimeout(() => {
+      patchIllustrationSettings(patch).catch(() => toast.error("儲存生圖設定失敗"));
+    }, 600);
   };
+
+  const handleNegativePromptChange = (v: string) => {
+    setNegativePrompt(v);
+    if (negSaveTimerRef.current) clearTimeout(negSaveTimerRef.current);
+    negSaveTimerRef.current = setTimeout(async () => {
+      if (!v.trim()) return;
+      try {
+        await patchIllustrationSettings({ negative_prompt: v });
+        await saveSettings({ illustration_negative_prompt: v });
+      } catch {
+        toast.error("儲存反向提示詞失敗");
+      }
+    }, 800);
+  };
+
 
   // 處理參考音訊檔案選擇
   const handleRefAudioSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -152,7 +162,7 @@ export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
     }
   };
 
-  const modeOptions: { id: TTSMode; label: string; desc: string; icon: JSX.Element }[] = [
+  const modeOptions: { id: TTSMode; label: string; desc: string; icon: React.ReactNode }[] = [
     {
       id: "clone",
       label: "聲音複製",
@@ -523,189 +533,278 @@ export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
             )}
           </section>
 
-          <hr style={{ borderColor: "var(--border)" }} />
-
-          {/* Section 3: 模型管理 */}
+          {/* Section 3: 插圖生成 */}
           <section className="flex flex-col gap-4">
             <div className="flex items-center gap-1.5 text-xs font-semibold text-amber-500 uppercase tracking-widest">
-              <Download size={14} />
-              <span>模型管理</span>
+              <ImagePlus size={14} />
+              <span>插圖生成</span>
             </div>
 
-            {/* 無模型載入時的提示 */}
-            {!loadingModels && models.length > 0 && !models.some(m => m.loaded) && (
-              <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg border border-amber-500/30 bg-amber-500/5 text-xs" style={{ color: "var(--text-secondary)" }}>
-                <span className="text-amber-400 mt-0.5 shrink-0">⚠</span>
-                <span>目前無模型載入，語音朗讀功能無法使用。請下載並載入一個模型。</span>
-              </div>
-            )}
+            {/* 人物一致性說明 */}
+            <div className="flex flex-col gap-1 pt-1 px-2.5 py-2 rounded border text-[10px]" style={{ borderColor: "var(--border)", backgroundColor: "var(--bg-hover)", color: "var(--text-secondary)" }}>
+              <span className="font-semibold" style={{ color: "var(--text-primary)" }}>人物一致性</span>
+              <span>選取角色後，生圖時自動注入結構化外觀描述（髮色、髮型、瞳色、體型等）至提示詞。</span>
+              <span>前往角色庫填寫角色外觀，可顯著提升同角色的一致性。</span>
+            </div>
 
-            {loadingModels && models.length === 0 ? (
-              <div className="text-center py-4 text-xs animate-pulse" style={{ color: "var(--text-secondary)" }}>
-                載入模型列表中...
-              </div>
-            ) : (
-              <div className="flex flex-col gap-3">
-                {models.map((m) => {
-                  const isActionLoading = (suffix: string) => modelActionLoading === m.id + suffix;
+            {/* Prompt 風格前綴 */}
+            <div className="flex flex-col gap-1.5 pt-1">
+              <span className="text-[11px] font-semibold" style={{ color: "var(--text-secondary)" }}>繪圖提示詞前綴（風格修飾）</span>
 
+              {/* 預設風格快選 */}
+              <div className="flex flex-wrap gap-1.5">
+                {STYLE_PRESETS.map((p) => {
+                  const active = illustrationPromptPrefix.trim() === p.value;
                   return (
-                    <div
-                      key={m.id}
-                      className="p-3 rounded-lg border flex flex-col gap-2 transition-all duration-300 relative overflow-hidden"
-                      style={{
-                        backgroundColor: m.loaded ? "rgba(245,158,11,0.06)" : m.active ? "var(--bg-hover)" : "transparent",
-                        borderColor: m.loaded
-                          ? "rgba(245,158,11,0.5)"
-                          : m.active
-                          ? "rgba(245,158,11,0.25)"
-                          : "var(--border)",
-                      }}
+                    <button
+                      key={p.label}
+                      onClick={() => setIllustrationPromptPrefix(active ? "" : p.value)}
+                      title={p.value}
+                      className={`px-2 py-1 rounded-full text-[10px] border transition-all ${
+                        active
+                          ? "border-amber-500 text-amber-500 font-bold bg-amber-500/10"
+                          : "border-transparent hover:bg-white/5"
+                      }`}
+                      style={{ backgroundColor: active ? undefined : "var(--bg-hover)", color: active ? undefined : "var(--text-secondary)" }}
                     >
-                      {/* 載入中的發光裝飾 */}
-                      {m.loaded && (
-                        <div className="absolute top-0 right-0 w-16 h-16 bg-amber-500/10 rounded-full blur-xl pointer-events-none" />
-                      )}
-
-                      {/* 模型名稱與狀態標籤 */}
-                      <div className="flex justify-between items-start">
-                        <div className="flex flex-col gap-0.5">
-                          <span className="text-xs font-bold flex items-center gap-1.5 flex-wrap">
-                            {m.name}
-                            {m.loaded && (
-                              <span className="px-1.5 py-0.5 text-[9px] rounded bg-amber-500 text-black font-extrabold uppercase tracking-wider">
-                                已載入
-                              </span>
-                            )}
-                            {m.active && !m.loaded && (
-                              <span className="px-1.5 py-0.5 text-[9px] rounded border border-amber-500/40 text-amber-500 font-bold uppercase tracking-wider">
-                                已選取
-                              </span>
-                            )}
-                          </span>
-                          <span className="text-[10px]" style={{ color: "var(--text-secondary)" }}>
-                            {m.type} · {m.size_str}
-                          </span>
-                        </div>
-
-                        {/* 操作按鈕群組 */}
-                        <div className="flex items-center gap-1 flex-shrink-0 ml-1">
-                          {/* 尚未下載 → 下載按鈕 */}
-                          {m.status === "not_downloaded" && (
-                            <button
-                              onClick={() => handleDownload(m.id)}
-                              disabled={!!modelActionLoading}
-                              className="px-2.5 py-1 rounded text-[10px] font-semibold bg-amber-500 text-black hover:bg-amber-600 active:scale-95 transition-all cursor-pointer disabled:opacity-50"
-                            >
-                              {isActionLoading("_download") ? (
-                                <Loader2 size={10} className="animate-spin" />
-                              ) : (
-                                "下載"
-                              )}
-                            </button>
-                          )}
-
-                          {/* 已下載且未載入 → 載入按鈕 + 刪除 */}
-                          {m.status === "downloaded" && !m.loaded && (
-                            <>
-                              <button
-                                onClick={() => handleLoad(m.id)}
-                                disabled={!!modelActionLoading}
-                                className="px-2.5 py-1 rounded text-[10px] font-semibold border border-amber-500/50 text-amber-500 hover:bg-amber-500/10 active:scale-95 transition-all cursor-pointer disabled:opacity-50 flex items-center gap-1"
-                              >
-                                {isActionLoading("_load") ? (
-                                  <Loader2 size={10} className="animate-spin" />
-                                ) : (
-                                  <><Cpu size={9} /> 載入</>
-                                )}
-                              </button>
-                              <button
-                                onClick={() => handleDelete(m.id)}
-                                disabled={!!modelActionLoading}
-                                className="p-1 rounded text-red-400 hover:bg-red-500/10 active:scale-95 transition-all cursor-pointer disabled:opacity-50"
-                                title="刪除模型"
-                              >
-                                {isActionLoading("_delete") ? (
-                                  <Loader2 size={11} className="animate-spin" />
-                                ) : (
-                                  <Trash2 size={11} />
-                                )}
-                              </button>
-                            </>
-                          )}
-
-                          {/* 已載入 → 卸載按鈕 + 刪除 */}
-                          {m.loaded && (
-                            <>
-                              <button
-                                onClick={() => handleUnload(m.id)}
-                                disabled={!!modelActionLoading}
-                                className="px-2.5 py-1 rounded text-[10px] font-semibold border border-white/20 text-gray-400 hover:bg-white/5 active:scale-95 transition-all cursor-pointer disabled:opacity-50 flex items-center gap-1"
-                              >
-                                {isActionLoading("_unload") ? (
-                                  <Loader2 size={10} className="animate-spin" />
-                                ) : (
-                                  "卸載"
-                                )}
-                              </button>
-                              <button
-                                onClick={() => handleDelete(m.id)}
-                                disabled={!!modelActionLoading}
-                                className="p-1 rounded text-red-400 hover:bg-red-500/10 active:scale-95 transition-all cursor-pointer disabled:opacity-50"
-                                title="刪除模型"
-                              >
-                                {isActionLoading("_delete") ? (
-                                  <Loader2 size={11} className="animate-spin" />
-                                ) : (
-                                  <Trash2 size={11} />
-                                )}
-                              </button>
-                            </>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* 下載進度條 */}
-                      {m.status === "downloading" && (
-                        <div className="flex flex-col gap-1 mt-1">
-                          <div className="flex justify-between text-[10px] font-semibold" style={{ color: "var(--text-secondary)" }}>
-                            <span>下載中...</span>
-                            <span className="font-mono">{m.progress}%</span>
-                          </div>
-                          <div className="w-full h-1.5 rounded-full overflow-hidden bg-white/10 relative">
-                            <div
-                              className="h-full bg-amber-500 rounded-full transition-all duration-300 relative overflow-hidden"
-                              style={{ width: `${m.progress}%` }}
-                            >
-                              <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent animate-pulse" />
-                            </div>
-                          </div>
-                          {/* 正在下載的模型也提供取消（刪除）按鈕 */}
-                          <button
-                            onClick={() => handleDelete(m.id)}
-                            disabled={!!modelActionLoading}
-                            className="self-end text-[9px] text-red-400 hover:underline mt-0.5"
-                          >
-                            取消下載
-                          </button>
-                        </div>
-                      )}
-
-                      {m.error && (
-                        <span className="text-[10px] text-red-400 leading-tight">
-                          錯誤: {m.error}
-                        </span>
-                      )}
-                    </div>
+                      {p.label}
+                    </button>
                   );
                 })}
               </div>
-            )}
+
+              <textarea
+                value={illustrationPromptPrefix}
+                onChange={(e) => setIllustrationPromptPrefix(e.target.value)}
+                placeholder="點上方風格快選，或自行輸入：anime style, watercolor, highly detailed"
+                rows={2}
+                className="w-full px-2.5 py-2 rounded border text-[10px] outline-none resize-none"
+                style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border)", color: "var(--text-primary)" }}
+              />
+              <span className="text-[9px] leading-relaxed" style={{ color: "var(--text-secondary)" }}>
+                每次生圖時附加在 LLM 生成的 prompt 前，可指定畫風、藝術風格等
+              </span>
+            </div>
+
+            {/* 圖片尺寸 */}
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[11px] font-semibold" style={{ color: "var(--text-secondary)" }}>圖片尺寸</span>
+              <div className="flex gap-2">
+                {([512, 768, 1024] as const).map((size) => (
+                  <button
+                    key={size}
+                    onClick={() => { setIllustrationWidth(size); setIllustrationHeight(size); }}
+                    className={`flex-1 py-1.5 rounded text-[10px] border transition-all ${
+                      illustrationWidth === size && illustrationHeight === size
+                        ? "border-amber-500 text-amber-500 font-bold bg-amber-500/5"
+                        : "border-transparent hover:bg-white/5"
+                    }`}
+                    style={{ backgroundColor: (illustrationWidth !== size || illustrationHeight !== size) ? "var(--bg-hover)" : undefined }}
+                  >
+                    {size}px
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* 固定 Seed */}
+            <div className="flex flex-col gap-1">
+              <div className="flex justify-between text-[11px]" style={{ color: "var(--text-secondary)" }}>
+                <span className="font-semibold">固定 Seed</span>
+                <span className="font-mono text-amber-500">{illustrationSeed === -1 ? "隨機" : illustrationSeed}</span>
+              </div>
+              <div className="flex gap-2 items-center">
+                <input
+                  type="number"
+                  min="-1"
+                  max="4294967295"
+                  value={illustrationSeed === -1 ? "" : illustrationSeed}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value, 10);
+                    setIllustrationSeed(isNaN(v) ? -1 : v);
+                  }}
+                  placeholder="-1（每次隨機）"
+                  className="flex-1 px-2 py-1.5 rounded border text-[10px] outline-none font-mono"
+                  style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border)", color: "var(--text-primary)" }}
+                />
+                {illustrationSeed !== -1 && (
+                  <button
+                    onClick={() => setIllustrationSeed(-1)}
+                    className="px-2 py-1.5 rounded text-[10px] text-red-400 hover:bg-red-500/10"
+                  >
+                    清除
+                  </button>
+                )}
+              </div>
+              <span className="text-[9px]" style={{ color: "var(--text-secondary)" }}>
+                填入固定數字可重現同一張圖，-1 表示每次隨機
+              </span>
+            </div>
+            {/* 生圖核心參數 */}
+            <div className="flex flex-col gap-3 pt-1 px-2.5 py-2.5 rounded border" style={{ borderColor: "var(--border)", backgroundColor: "var(--bg-hover)" }}>
+              <span className="text-[11px] font-semibold" style={{ color: "var(--text-primary)" }}>擴散參數</span>
+
+              {/* Steps */}
+              <div className="flex flex-col gap-1">
+                <div className="flex justify-between text-[10px]" style={{ color: "var(--text-secondary)" }}>
+                  <span>採樣步數</span>
+                  <span className="font-mono font-bold text-amber-400">{illSteps}</span>
+                </div>
+                <input type="range" min="20" max="40" step="1" value={illSteps}
+                  onChange={e => { const v = +e.target.value; setIllSteps(v); patchIll({ steps: v }); }}
+                  className="w-full h-1 rounded accent-amber-500 cursor-pointer" />
+                <div className="flex justify-between text-[9px]" style={{ color: "var(--text-secondary)" }}>
+                  <span>20（快速）</span><span>30（建議）</span><span>40（精細）</span>
+                </div>
+              </div>
+
+              {/* CFG */}
+              <div className="flex flex-col gap-1">
+                <div className="flex justify-between text-[10px]" style={{ color: "var(--text-secondary)" }}>
+                  <span>CFG Scale（提示詞相關性）</span>
+                  <span className="font-mono font-bold text-amber-400">{illCfg.toFixed(1)}</span>
+                </div>
+                <input type="range" min="4.0" max="8.0" step="0.5" value={illCfg}
+                  onChange={e => { const v = +e.target.value; setIllCfg(v); patchIll({ guidance_scale: v }); }}
+                  className="w-full h-1 rounded accent-amber-500 cursor-pointer" />
+                <div className="flex justify-between text-[9px]" style={{ color: "var(--text-secondary)" }}>
+                  <span>4.0（柔和）</span><span>6.0（建議）</span><span>8.0（強烈）</span>
+                </div>
+              </div>
+
+              {/* Hires Fix */}
+              <div className="flex flex-col gap-1.5">
+                <div className="flex items-center justify-between">
+                  <div className="flex flex-col">
+                    <span className="text-[10px] font-semibold" style={{ color: "var(--text-primary)" }}>Hires Fix 高解析度精修</span>
+                    <span className="text-[9px]" style={{ color: "var(--text-secondary)" }}>
+                      生圖後上採樣 {Math.round(1024 * 1.5)}px × img2img 補細節（臉、手）
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => { setHiresEnabled(v => { patchIll({ hires_fix_enabled: !v }); return !v; }); }}
+                    className={`relative w-9 h-5 rounded-full transition-colors ${hiresEnabled ? "bg-amber-500" : "bg-white/20"}`}
+                  >
+                    <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${hiresEnabled ? "translate-x-4" : ""}`} />
+                  </button>
+                </div>
+
+                {hiresEnabled && (
+                  <div className="flex flex-col gap-1">
+                    <div className="flex justify-between text-[10px]" style={{ color: "var(--text-secondary)" }}>
+                      <span>重繪強度（Denoise）</span>
+                      <span className="font-mono font-bold text-amber-400">{hiresDenoise.toFixed(2)}</span>
+                    </div>
+                    <input type="range" min="0.25" max="0.5" step="0.05" value={hiresDenoise}
+                      onChange={e => { const v = +e.target.value; setHiresDenoise(v); patchIll({ hires_denoise: v }); }}
+                      className="w-full h-1 rounded accent-amber-500 cursor-pointer" />
+                    <div className="flex justify-between text-[9px]" style={{ color: "var(--text-secondary)" }}>
+                      <span>0.25（保留原構圖）</span><span>0.5（較大重繪）</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* ADetailer */}
+              <div className="flex flex-col gap-1.5">
+                <div className="flex items-center justify-between">
+                  <div className="flex flex-col">
+                    <span className="text-[10px] font-semibold" style={{ color: "var(--text-primary)" }}>ADetailer 臉部精修</span>
+                    <span className="text-[9px]" style={{ color: "var(--text-secondary)" }}>
+                      InsightFace 偵測臉部 → 局部 img2img 重繪 → 羽化貼回
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => { setAdetailerEnabled(v => { patchIll({ adetailer_enabled: !v }); return !v; }); }}
+                    className={`relative w-9 h-5 rounded-full transition-colors ${adetailerEnabled ? "bg-amber-500" : "bg-white/20"}`}
+                  >
+                    <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${adetailerEnabled ? "translate-x-4" : ""}`} />
+                  </button>
+                </div>
+
+                {adetailerEnabled && (
+                  <div className="flex flex-col gap-1">
+                    <div className="flex justify-between text-[10px]" style={{ color: "var(--text-secondary)" }}>
+                      <span>重繪強度（Denoise）</span>
+                      <span className="font-mono font-bold text-amber-400">{adetailerDenoise.toFixed(2)}</span>
+                    </div>
+                    <input type="range" min="0.25" max="0.55" step="0.05" value={adetailerDenoise}
+                      onChange={e => { const v = +e.target.value; setAdetailerDenoise(v); patchIll({ adetailer_denoise: v }); }}
+                      className="w-full h-1 rounded accent-amber-500 cursor-pointer" />
+                    <div className="flex justify-between text-[9px]" style={{ color: "var(--text-secondary)" }}>
+                      <span>0.25（微調）</span><span>0.4（建議）</span><span>0.55（大重繪）</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* LoRA 模組 */}
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-semibold" style={{ color: "var(--text-secondary)" }}>LoRA 模組</span>
+                <span className="text-[9px]" style={{ color: "var(--text-secondary)" }}>變更後需重新載入模型</span>
+              </div>
+              {availableLoras.length === 0 ? (
+                <div className="text-[10px] px-2.5 py-2 rounded border" style={{ borderColor: "var(--border)", color: "var(--text-secondary)", backgroundColor: "var(--bg-hover)" }}>
+                  找不到 LoRA（請將 .safetensors 放入 models/loras/）
+                </div>
+              ) : (
+                <div className="flex flex-col gap-1.5">
+                  {availableLoras.map(lora => {
+                    const state = getLoraState(lora.filename);
+                    const shortName = lora.filename.replace(/\.(safetensors|bin|pt)$/, "").slice(0, 32);
+                    return (
+                      <div key={lora.filename} className="flex flex-col gap-1 px-2.5 py-2 rounded border"
+                        style={{ borderColor: state.enabled ? "var(--border-accent, #f59e0b66)" : "var(--border)", backgroundColor: "var(--bg-hover)" }}>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => toggleLora(lora.filename)}
+                            className={`relative w-8 h-4 rounded-full transition-colors shrink-0 ${state.enabled ? "bg-amber-500" : "bg-white/20"}`}
+                          >
+                            <span className={`absolute top-0.5 left-0.5 w-3 h-3 bg-white rounded-full shadow transition-transform ${state.enabled ? "translate-x-4" : ""}`} />
+                          </button>
+                          <span className="flex-1 text-[10px] truncate" title={lora.filename} style={{ color: state.enabled ? "var(--text-primary)" : "var(--text-secondary)" }}>
+                            {shortName}
+                          </span>
+                          <span className="text-[9px] shrink-0" style={{ color: "var(--text-secondary)" }}>{lora.size_mb}MB</span>
+                        </div>
+                        {state.enabled && (
+                          <div className="flex items-center gap-2 mt-0.5">
+                            <span className="text-[9px] shrink-0" style={{ color: "var(--text-secondary)" }}>強度</span>
+                            <input type="range" min="0.1" max="1.5" step="0.05" value={state.weight}
+                              onChange={e => setLoraWeight(lora.filename, +e.target.value)}
+                              className="flex-1 h-1 rounded accent-amber-500 cursor-pointer" />
+                            <span className="text-[9px] font-mono w-7 text-right text-amber-400">{state.weight.toFixed(2)}</span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* 反向提示詞 */}
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[11px] font-semibold" style={{ color: "var(--text-secondary)" }}>反向提示詞（不希望出現的元素）</span>
+              <textarea
+                value={negativePrompt}
+                onChange={(e) => handleNegativePromptChange(e.target.value)}
+                placeholder="輸入不希望出現的元素，例如：extra limbs, blurry, watermark"
+                rows={3}
+                className="w-full px-2.5 py-2 rounded border text-[10px] outline-none resize-none"
+                style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border)", color: "var(--text-primary)" }}
+              />
+              <span className="text-[9px] leading-relaxed" style={{ color: "var(--text-secondary)" }}>
+                修改後自動儲存（0.8 秒延遲），重啟後保留
+              </span>
+            </div>
           </section>
 
           <hr style={{ borderColor: "var(--border)" }} />
 
-          {/* Section 4: 硬體資訊 */}
+          {/* 硬體資訊 */}
           <section className="flex flex-col gap-4">
             <div className="flex items-center gap-1.5 text-xs font-semibold text-amber-500 uppercase tracking-widest">
               <HardDrive size={14} />

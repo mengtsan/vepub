@@ -1,120 +1,319 @@
 """
-模型管理路由器。
-提供下載、刪除、選擇啟用、載入至記憶體、卸載與狀態查詢的 API 端點。
+模型管理路由器（統一管理 TTS / Image / LLM 三類模型）。
+
+端點：
+  GET  /v1/models/                         所有已安裝模型 + 狀態
+  POST /v1/models/probe                    偵測 URL 類型
+  POST /v1/models/download                 開始下載
+  GET  /v1/models/download/{task_id}       SSE 下載進度
+  DELETE /v1/models/download/{task_id}     取消下載
+  POST /v1/models/{category}/activate     切換啟用模型（hot-swap）
+  DELETE /v1/models/{category}/{model_id}  刪除模型
 """
+import asyncio
+import json
+import os
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from services.models_manager import (
-    get_models_status_list,
-    start_download_thread,
-    delete_model_files,
-    set_current_model_id,
-    check_model_downloaded,
-    get_engine_loaded_model_id,
-)
+from services import model_registry, downloader
 
 router = APIRouter()
 
-class ModelActionRequest(BaseModel):
-    model_id: str
 
-@router.get("/status")
-async def get_status():
-    """
-    查詢所有模型的下載狀態、進度、啟用狀態與引擎載入狀態。
-    """
+# ─── Request / Response 模型 ──────────────────────────────────────────────────
+
+class ProbeRequest(BaseModel):
+    url: str
+
+class DownloadRequest(BaseModel):
+    url: str
+    category: str           # "tts" | "image" | "llm"
+    name: str               # 使用者填寫的顯示名稱
+    role: str = "chat"      # 僅 LLM 使用："chat" | "analysis"
+
+class ActivateRequest(BaseModel):
+    model_id: str
+    role: str = "default"   # 僅 LLM 使用
+
+class PatchModelRequest(BaseModel):
+    style: str | None = None   # "anime" | "real" | null = 清除
+
+class TokenRequest(BaseModel):
+    token: str
+
+
+# ─── 列出所有模型 ─────────────────────────────────────────────────────────────
+
+@router.get("/")
+async def list_all_models(request: Request):
+    """回傳三類模型的完整狀態，包含目前 active 及 loaded 狀態。"""
+    reg = model_registry.get_registry()
+
+    tts_backend  = getattr(request.app.state, "tts",   None)
+    image_backend = getattr(request.app.state, "image", None)
+
+    def _enrich(category: str, cat_data: dict) -> dict:
+        active = cat_data.get("active") or cat_data.get("chat") or cat_data.get("analysis")
+        models = cat_data.get("models", {})
+        result = []
+        for mid, info in models.items():
+            m = dict(info)
+            m["id"] = mid
+            m["is_active"] = (
+                mid == cat_data.get("active")
+                or mid == cat_data.get("chat")
+                or mid == cat_data.get("analysis")
+            )
+            # 是否已 loaded
+            if category == "tts" and tts_backend and hasattr(tts_backend, "model_id"):
+                m["is_loaded"] = (tts_backend.model_id == mid and tts_backend.is_loaded())
+            elif category == "image" and image_backend and hasattr(image_backend, "model_id"):
+                m["is_loaded"] = (image_backend.model_id == mid)
+            else:
+                m["is_loaded"] = False
+            result.append(m)
+        return {"active": active, "models": result}
+
+    return {
+        "tts":   _enrich("tts",   reg.get("tts",   {})),
+        "image": _enrich("image", reg.get("image", {})),
+        "llm":   {
+            "chat":     reg.get("llm", {}).get("chat"),
+            "analysis": reg.get("llm", {}).get("analysis"),
+            "models": [
+                dict(info, id=mid)
+                for mid, info in reg.get("llm", {}).get("models", {}).items()
+            ],
+        },
+    }
+
+
+# ─── Probe URL ────────────────────────────────────────────────────────────────
+
+@router.post("/scan")
+async def scan_models():
+    """掃描本機 models/image/ 與 models/llm/ 目錄，自動登錄新發現的模型檔案。"""
+    added = model_registry.scan_local_models()
+    return {"added": added, "message": f"掃描完成，新增 {added} 個模型"}
+
+
+@router.post("/probe")
+async def probe_url(req: ProbeRequest):
+    """偵測連結的模型類型與基本資訊（不下載）。"""
     try:
-        return {"models": get_models_status_list()}
+        result = await downloader.probe_url(req.url)
+        return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"獲取模型狀態失敗: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ─── 下載 ─────────────────────────────────────────────────────────────────────
 
 @router.post("/download")
-async def download_model(req: ModelActionRequest):
-    """
-    發起模型下載請求，將在背景執行緒中進行下載。
-    """
-    success = start_download_thread(req.model_id)
-    if not success:
-        raise HTTPException(status_code=400, detail="發起下載失敗，請確認模型 ID 是否正確或已在下載中")
-    return {"status": "success", "message": f"模型 {req.model_id} 已在背景啟動下載"}
+async def start_download(req: DownloadRequest):
+    """啟動下載任務，立即回傳 task_id。"""
+    if req.category not in ("tts", "image", "llm"):
+        raise HTTPException(status_code=400, detail="category 必須是 tts / image / llm")
+    probe = await downloader.probe_url(req.url)
+    task_id = await downloader.start_download(probe, req.category, req.name)
+    return {"task_id": task_id}
 
-@router.post("/delete")
-async def delete_model(req: ModelActionRequest, request: Request):
+
+@router.get("/download/{task_id}")
+async def download_progress(task_id: str):
+    """SSE 串流下載進度。前端用 EventSource 連接。"""
+    async def _event_stream():
+        while True:
+            task = downloader.get_task(task_id)
+            if task is None:
+                yield f"data: {json.dumps({'error': 'task_not_found'})}\n\n"
+                break
+            yield f"data: {json.dumps(task)}\n\n"
+            if task["status"] in ("done", "error", "cancelled"):
+                break
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/civitai-token")
+async def get_civitai_token():
+    """回傳目前儲存的 CivitAI token（遮蔽大部分字元）。"""
+    token = downloader.get_civitai_token()
+    if not token:
+        return {"set": False, "preview": ""}
+    preview = token[:4] + "…" + token[-4:] if len(token) > 8 else "****"
+    return {"set": True, "preview": preview}
+
+
+@router.post("/civitai-token")
+async def set_civitai_token(req: TokenRequest):
+    """儲存 CivitAI API token。"""
+    downloader.set_civitai_token(req.token)
+    return {"status": "ok"}
+
+
+@router.delete("/download/{task_id}")
+async def cancel_download(task_id: str):
+    """取消進行中的下載。"""
+    ok = downloader.cancel_task(task_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="下載任務不存在")
+    return {"status": "cancelled"}
+
+
+# ─── 切換啟用（Hot-swap）─────────────────────────────────────────────────────
+
+@router.post("/{category}/activate")
+async def activate_model(category: str, req: ActivateRequest, request: Request):
     """
-    刪除指定的本地模型實體檔案。
-    若模型正在下載中，會先設置取消旗標使下載停止，再刪除所有相關檔案（包含暫存檔）。
-    若模型目前已載入引擎（safetensors mmap 會在 Windows 上鎖定檔案），會先卸載再刪除。
+    切換啟用的模型並進行 hot-swap（unload 舊的 → load 新的）。
+    LLM 無需 load/unload（per-call subprocess），只更新 registry。
     """
-    from services.tts_engine import TTSEngine
+    if category not in ("tts", "image", "llm"):
+        raise HTTPException(status_code=400, detail="不支援的 category")
 
-    tts: TTSEngine = request.app.state.tts
-    if tts.is_loaded():
-        loaded_id = get_engine_loaded_model_id()
-        if loaded_id == req.model_id:
-            await tts.unload()
+    info = model_registry.get_model(category, req.model_id)
+    if info is None:
+        raise HTTPException(status_code=404, detail=f"模型 {req.model_id!r} 不在登錄檔中")
 
-    success = delete_model_files(req.model_id)
-    if not success:
-        raise HTTPException(status_code=400, detail=f"刪除模型 {req.model_id} 失敗")
-    return {"status": "success", "message": f"模型 {req.model_id} 已成功刪除"}
+    # ── LLM：只更新 registry ──────────────────────────────────────────────
+    if category == "llm":
+        model_registry.activate_model("llm", req.model_id, role=req.role)
+        return {"status": "ok", "model_id": req.model_id, "role": req.role}
 
-@router.post("/select")
-async def select_model(req: ModelActionRequest):
-    """
-    設定目前啟用的模型 ID（儲存至資料庫）。
-    注意：此操作只更新資料庫設定，不會立即切換已載入的引擎。
-    若要讓新設定立刻生效，請呼叫 /load。
-    """
-    success = set_current_model_id(req.model_id)
-    if not success:
-        raise HTTPException(status_code=400, detail=f"啟用模型 {req.model_id} 失敗，可能是不支援的模型 ID")
-    return {"status": "success", "message": f"已成功將 {req.model_id} 設定為當前啟用模型"}
+    # ── TTS hot-swap ──────────────────────────────────────────────────────
+    if category == "tts":
+        new_backend = _build_tts_backend(req.model_id, info, request)
+        old_backend = getattr(request.app.state, "tts", None)
+        if old_backend and old_backend.is_loaded():
+            await old_backend.unload()
+        request.app.state.tts = new_backend
+        model_registry.activate_model("tts", req.model_id)
+        return {"status": "ok", "model_id": req.model_id}
 
-@router.post("/load")
-async def load_model(req: ModelActionRequest, request: Request):
-    """
-    動態載入指定模型至 TTS 引擎記憶體中。
-    此操作會：
-      1. 先將當前已載入的模型從記憶體中卸載（釋放資源）
-      2. 更新資料庫設定
-      3. 重新載入指定模型
+    # ── Image hot-swap ────────────────────────────────────────────────────
+    if category == "image":
+        new_backend = _build_image_backend(req.model_id, info, request)
+        old_backend = getattr(request.app.state, "image", None)
+        if old_backend and await old_backend.is_ready():
+            await old_backend.unload()
+        request.app.state.image = new_backend
+        model_registry.activate_model("image", req.model_id)
+        return {"status": "ok", "model_id": req.model_id}
 
-    注意：此為長時間阻塞操作（需等待模型載入完成），前端應顯示載入中提示。
-    """
-    from services.tts_engine import TTSEngine
 
-    # 確認模型已下載
-    if not check_model_downloaded(req.model_id) and req.model_id != "official":
-        raise HTTPException(
-            status_code=400,
-            detail=f"模型 {req.model_id} 尚未下載，請先下載後再載入"
-        )
+# ─── 更新模型屬性（style 等）─────────────────────────────────────────────────
 
-    tts: TTSEngine = request.app.state.tts
+@router.patch("/{category}/{model_id}")
+async def patch_model(category: str, model_id: str, req: PatchModelRequest):
+    """更新 registry 中模型的可設定欄位（目前僅 style）。"""
+    if category not in ("tts", "image", "llm"):
+        raise HTTPException(status_code=400, detail="不支援的 category")
     try:
-        await tts.load_specific(req.model_id)
-        return {
-            "status": "success",
-            "message": f"模型 {req.model_id} 已成功載入至記憶體"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"載入模型失敗: {str(e)}")
+        patch = {k: v for k, v in req.model_dump().items() if k in req.model_fields_set}
+        updated = model_registry.patch_model_info(category, model_id, patch)
+        return updated
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-@router.post("/unload")
-async def unload_model(request: Request):
-    """
-    從 TTS 引擎記憶體中卸載目前載入的模型，釋放 GPU/CPU 記憶體。
-    卸載後若需要繼續播放，請重新呼叫 /load。
-    """
-    from services.tts_engine import TTSEngine
-    from services.models_manager import set_engine_loaded_model_id
 
-    tts: TTSEngine = request.app.state.tts
-    if not tts.is_loaded():
-        return {"status": "success", "message": "模型目前已是卸載狀態，無需操作"}
+# ─── 刪除 ─────────────────────────────────────────────────────────────────────
 
-    try:
-        await tts.unload()
-        return {"status": "success", "message": "模型已成功從記憶體中卸載"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"卸載模型失敗: {str(e)}")
+@router.delete("/{category}/{model_id}")
+async def delete_model(category: str, model_id: str, request: Request):
+    """刪除模型（先 unload，再刪檔，再從 registry 移除）。"""
+    info = model_registry.get_model(category, model_id)
+    if not info:
+        raise HTTPException(status_code=404, detail="模型不在登錄檔中")
+
+    # 若正在使用中，先 unload
+    if category == "tts":
+        backend = getattr(request.app.state, "tts", None)
+        if backend and backend.is_loaded() and getattr(backend, "model_id", None) == model_id:
+            await backend.unload()
+    elif category == "image":
+        backend = getattr(request.app.state, "image", None)
+        if backend and await backend.is_ready() and getattr(backend, "model_id", None) == model_id:
+            await backend.unload()
+
+    model_registry.delete_model_entry(category, model_id, remove_files=True)
+    return {"status": "deleted", "model_id": model_id}
+
+
+# ─── 後端工廠 ─────────────────────────────────────────────────────────────────
+
+def _build_tts_backend(model_id: str, info: dict, request: Request):
+    model_type = info.get("type", "omnivoice")
+    local_path = info.get("local_path", "")
+
+    if model_type == "omnivoice":
+        from services.backends.tts_omnivoice import OmniVoiceBackend
+        from services.tts_engine import TTSEngine
+        hw = getattr(request.app.state, "hardware", {})
+        device = hw.get("recommended_device", "cpu")
+        engine = TTSEngine(device=device)
+        b = OmniVoiceBackend(engine)
+        b.model_id = model_id
+        return b
+
+    from services.backends.tts_pipeline import TransformersTTSBackend
+    hw = getattr(request.app.state, "hardware", {})
+    device = hw.get("recommended_device", "cpu")
+    b = TransformersTTSBackend(model_id=model_id, local_path=local_path, device=device)
+    return b
+
+
+def _build_image_backend(model_id: str, info: dict, request: Request):
+    # Image pipeline is managed directly by illustration_engine.py (dual-model auto-switch)
+    return None
+
+
+def build_active_tts(request_or_app) -> object | None:
+    """從 registry 建立目前啟用的 TTS 後端（啟動時呼叫）。"""
+    info = model_registry.get_active_model("tts")
+    if not info:
+        return None
+    mid = info.get("_id", "unknown")
+    return _build_tts_backend_raw(mid, info, request_or_app)
+
+
+def build_active_image(request_or_app) -> object | None:
+    """從 registry 建立目前啟用的 Image 後端（啟動時呼叫）。"""
+    info = model_registry.get_active_model("image")
+    if not info:
+        return None
+    mid = info.get("_id", "unknown")
+    return _build_image_backend_raw(mid, info, request_or_app)
+
+
+def _build_tts_backend_raw(model_id: str, info: dict, app_or_state):
+    """不依賴 Request 物件的工廠函式（lifespan 使用）。"""
+    model_type = info.get("type", "omnivoice")
+    local_path  = info.get("local_path", "")
+    hw = getattr(app_or_state, "hardware", {}) if hasattr(app_or_state, "hardware") else {}
+    device = hw.get("recommended_device", "cpu")
+
+    if model_type == "omnivoice":
+        from services.backends.tts_omnivoice import OmniVoiceBackend
+        from services.tts_engine import TTSEngine
+        engine = TTSEngine(device=device)
+        b = OmniVoiceBackend(engine)
+        b.model_id = model_id
+        return b
+
+    from services.backends.tts_pipeline import TransformersTTSBackend
+    return TransformersTTSBackend(model_id=model_id, local_path=local_path, device=device)
+
+
+def _build_image_backend_raw(model_id: str, info: dict, app_or_state):
+    # Image pipeline is managed directly by illustration_engine.py (dual-model auto-switch)
+    return None

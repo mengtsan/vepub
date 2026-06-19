@@ -1,9 +1,14 @@
 import React, { useEffect, useState, useRef } from "react";
+import { toast } from "sonner";
 import { useRouter } from "@tanstack/react-router";
 import { useLibraryStore } from "@/stores/library";
 import { useReaderStore } from "@/stores/reader";
-import { Plus, Search, Trash2, Loader, Book as BookIcon } from "lucide-react";
+import { Plus, Search, Trash2, Loader, Book as BookIcon, FlaskConical, Cpu, WifiOff } from "lucide-react";
 import { Book } from "@/lib/api";
+import { BACKEND_BASE_URL } from "@/lib/constants";
+
+const HEALTH_INTERVAL_MS = 500;
+const HEALTH_TIMEOUT_MS  = 30_000;
 
 export default function Library() {
   const router = useRouter();
@@ -11,14 +16,46 @@ export default function Library() {
   const { loadSettings, fetchHardwareInfo } = useReaderStore();
   const [searchQuery, setSearchQuery] = useState("");
   const [isDragging, setIsDragging] = useState(false);
+  const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // 初始化載入書庫與硬體狀態
+  const [backendReady,   setBackendReady]   = useState(false);
+  const [backendTimeout, setBackendTimeout] = useState(false);
+
+  // 輪詢 /health，直到後端就緒或逾時
   useEffect(() => {
+    let cancelled = false;
+    let elapsed   = 0;
+
+    async function poll() {
+      while (!cancelled) {
+        try {
+          const res = await fetch(`${BACKEND_BASE_URL}/health`);
+          if (res.ok) {
+            if (!cancelled) setBackendReady(true);
+            return;
+          }
+        } catch {}
+        elapsed += HEALTH_INTERVAL_MS;
+        if (elapsed >= HEALTH_TIMEOUT_MS) {
+          if (!cancelled) setBackendTimeout(true);
+          return;
+        }
+        await new Promise<void>(r => setTimeout(r, HEALTH_INTERVAL_MS));
+      }
+    }
+
+    poll();
+    return () => { cancelled = true; };
+  }, []);
+
+  // 後端就緒後才初始化書庫與硬體資訊
+  useEffect(() => {
+    if (!backendReady) return;
     fetchBooks();
     loadSettings();
     fetchHardwareInfo();
-  }, [fetchBooks, loadSettings, fetchHardwareInfo]);
+  }, [backendReady, fetchBooks, loadSettings, fetchHardwareInfo]);
 
   // 篩選書籍
   const filteredBooks = books.filter((book) => {
@@ -35,15 +72,21 @@ export default function Library() {
     router.navigate({ to: "/reader" });
   };
 
-  // 處理刪除書籍
-  const handleDeleteBook = async (e: React.MouseEvent, bookId: string) => {
+  // 處理刪除書籍（開啟確認 modal）
+  const handleDeleteBook = (e: React.MouseEvent, bookId: string) => {
     e.stopPropagation();
-    if (confirm("您確定要將這本書自書庫中刪除嗎？檔案也將一併移除。")) {
-      try {
-        await removeBook(bookId);
-      } catch (err) {
-        alert("刪除書籍失敗");
-      }
+    setDeleteTargetId(bookId);
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTargetId) return;
+    const id = deleteTargetId;
+    setDeleteTargetId(null);
+    try {
+      await removeBook(id);
+      toast.success("書籍已刪除");
+    } catch {
+      toast.error("刪除書籍失敗");
     }
   };
 
@@ -54,7 +97,7 @@ export default function Library() {
       try {
         await importBook(files[0]);
       } catch (err) {
-        alert("匯入書籍失敗，請確認檔案格式是否正確。");
+        toast.error("匯入書籍失敗，請確認檔案格式是否正確。");
       }
     }
   };
@@ -78,10 +121,10 @@ export default function Library() {
       try {
         await importBook(epubFile);
       } catch (err) {
-        alert("拖放匯入書籍失敗，請確認檔案格式是否正確。");
+        toast.error("拖放匯入書籍失敗，請確認檔案格式是否正確。");
       }
     } else {
-      alert("僅支援匯入 .epub 格式的電子書！");
+      toast.warning("僅支援匯入 .epub 格式的電子書");
     }
   };
 
@@ -95,6 +138,42 @@ export default function Library() {
       onDrop={handleDrop}
       style={{ backgroundColor: "var(--bg-primary)", color: "var(--text-primary)" }}
     >
+      {/* 後端啟動等待遮罩 */}
+      {!backendReady && (
+        <div
+          className="fixed inset-0 z-[100] flex flex-col items-center justify-center gap-4"
+          style={{ backgroundColor: "var(--bg-primary)" }}
+        >
+          {backendTimeout ? (
+            <>
+              <WifiOff className="text-red-400 mb-2" size={48} />
+              <p className="text-lg font-semibold" style={{ color: "var(--text-primary)" }}>
+                無法連接後端服務
+              </p>
+              <p className="text-sm text-center max-w-xs leading-relaxed" style={{ color: "var(--text-secondary)" }}>
+                後端在 30 秒內未回應。請確認服務已啟動，然後重新開啟應用程式。
+              </p>
+              <code
+                className="text-xs px-3 py-1.5 rounded mt-2"
+                style={{ backgroundColor: "var(--bg-surface)", color: "var(--text-muted)" }}
+              >
+                npm run dev
+              </code>
+            </>
+          ) : (
+            <>
+              <Loader className="animate-spin text-amber-500" size={40} />
+              <p className="text-sm tracking-widest" style={{ color: "var(--text-secondary)" }}>
+                後端啟動中…
+              </p>
+              <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+                首次啟動需要數秒鐘
+              </p>
+            </>
+          )}
+        </div>
+      )}
+
       {/* 隱藏的 File Input */}
       <input
         type="file"
@@ -109,6 +188,24 @@ export default function Library() {
         <div className="flex items-center gap-2">
           <BookIcon className="text-amber-500" size={24} />
           <h1 className="text-xl font-bold tracking-wider">EPUB TTS Reader</h1>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => router.navigate({ to: "/models" })}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded border text-xs hover:bg-white/10 transition-colors text-emerald-400"
+            style={{ borderColor: "var(--border)" }}
+          >
+            <Cpu size={14} />
+            模型管理
+          </button>
+          <button
+            onClick={() => router.navigate({ to: "/illustration-test" })}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded border text-xs hover:bg-white/10 transition-colors"
+            style={{ borderColor: "var(--border)" }}
+          >
+            <FlaskConical size={14} />
+            插圖測試台
+          </button>
         </div>
 
         <div className="flex items-center gap-4">
@@ -276,6 +373,40 @@ export default function Library() {
             <span className="text-xs" style={{ color: "var(--text-secondary)" }}>匯入電子書</span>
           </div>
         </main>
+      )}
+
+      {/* 刪除確認 Modal */}
+      {deleteTargetId && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+          onClick={() => setDeleteTargetId(null)}
+        >
+          <div
+            className="rounded-xl p-6 w-80 shadow-2xl flex flex-col gap-4"
+            style={{ backgroundColor: "var(--bg-secondary)", border: "1px solid var(--border)" }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <p className="text-sm" style={{ color: "var(--text-primary)" }}>
+              確定要刪除這本書嗎？實體檔案也將一併移除，此動作無法復原。
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setDeleteTargetId(null)}
+                className="px-4 py-1.5 rounded-lg text-sm transition-colors"
+                style={{ backgroundColor: "var(--bg-tertiary)", color: "var(--text-secondary)" }}
+              >
+                取消
+              </button>
+              <button
+                onClick={confirmDelete}
+                className="px-4 py-1.5 rounded-lg text-sm font-medium transition-colors"
+                style={{ backgroundColor: "#dc2626", color: "#fff" }}
+              >
+                刪除
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

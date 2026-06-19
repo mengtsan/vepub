@@ -1,4 +1,5 @@
-const BASE_URL = "http://127.0.0.1:8765";
+import { BACKEND_BASE_URL } from "./constants";
+const BASE_URL = BACKEND_BASE_URL;
 
 export interface Book {
   id: string;
@@ -22,6 +23,7 @@ export interface ChapterMeta {
 
 export interface ParseResult {
   book_id: string;
+  duplicate?: boolean;
   meta: {
     title: string;
     author: string | null;
@@ -30,10 +32,6 @@ export interface ParseResult {
     chapter_count: number;
   };
   chapters: ChapterMeta[];
-  _chapters_data: {
-    id: string;
-    paragraphs: string[];
-  }[];
 }
 
 export interface Sentence {
@@ -203,6 +201,447 @@ export async function getChapterParagraphs(bookId: string, chapterId: string): P
   return data.paragraphs;
 }
 
+export interface Bookmark {
+  id: number;
+  chapter_index: number;
+  sentence_index: number;
+  note: string;
+  created_at: number;
+}
+
+/**
+ * 取得指定書籍的所有書籤。
+ */
+export async function getBookmarks(bookId: string): Promise<Bookmark[]> {
+  const res = await fetch(`${BASE_URL}/epub/${bookId}/bookmarks`);
+  if (!res.ok) throw new Error("取得書籤失敗");
+  return res.json();
+}
+
+/**
+ * 新增書籤。
+ */
+export async function createBookmark(
+  bookId: string,
+  chapterIndex: number,
+  sentenceIndex: number,
+  note: string = ""
+): Promise<{ id: number }> {
+  const res = await fetch(`${BASE_URL}/epub/${bookId}/bookmarks`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chapter_index: chapterIndex, sentence_index: sentenceIndex, note }),
+  });
+  if (!res.ok) throw new Error("新增書籤失敗");
+  return res.json();
+}
+
+/**
+ * 刪除書籤。
+ */
+export async function deleteBookmark(bookId: string, bookmarkId: number): Promise<void> {
+  const res = await fetch(`${BASE_URL}/epub/${bookId}/bookmarks/${bookmarkId}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error("刪除書籤失敗");
+}
+
+// ─── 插圖 API ────────────────────────────────────────────────────────────────
+
+export interface CharacterImage {
+  id: number;
+  angle: string;        // 正面/側面/半身/全身/其他
+  is_primary: number;   // 1 = primary
+  created_at: number;
+  prompt?: string | null;
+}
+
+export interface Character {
+  id: number;
+  name: string;
+  // ── 基本 ──
+  gender: string | null;
+  age_hint: string | null;
+  // ── 面部特徵 ──
+  skin_tone: string | null;
+  face_shape: string | null;
+  hair_color: string | null;
+  hair_style: string | null;
+  eye_color: string | null;
+  eye_shape: string | null;
+  // ── 體型 ──
+  body_type: string | null;
+  height_cm: number | null;
+  weight_kg: number | null;
+  bwh: string | null;
+  cup_size: string | null;
+  // ── 服飾配件 ──
+  era_style: string | null;
+  signature_outfit: string | null;
+  color_palette: string | null;
+  accessories: string | null;
+  // ── 特殊特徵 ──
+  distinctive_marks: string | null;
+  special_traits: string | null;
+  other_features: string | null;
+  // ── 系統 ──
+  character_seed: number;
+  locked: number;
+  // ── 相容舊版 ──
+  description: string;
+  ref_image_base64: string | null;
+  // ── 後端組合 ──
+  primary_image_url: string | null;
+  images: CharacterImage[];
+  created_at: number;
+}
+
+export async function getIllustrationStatus(): Promise<{ llm_available: boolean; llm_model: string | null; model_loaded: boolean }> {
+  const res = await fetch(`${BASE_URL}/illustration/status`);
+  if (!res.ok) return { llm_available: false, llm_model: null, model_loaded: false };
+  return res.json();
+}
+
+export async function preloadIllustrationModel(): Promise<void> {
+  await fetch(`${BASE_URL}/illustration/load`, { method: "POST" });
+}
+
+export async function unloadIllustrationModel(): Promise<void> {
+  await fetch(`${BASE_URL}/illustration/unload`, { method: "POST" });
+}
+
+export interface IllustrationMeta {
+  model_name?: string;
+  steps?: number;
+  guidance_scale?: number;
+  seed?: number;
+  width?: number;
+  height?: number;
+  is_anime?: boolean;
+}
+
+export interface IllustrationTaskResult extends IllustrationMeta {
+  id: number | null;
+  image_url?: string | null;
+  image_base64?: string | null;
+  prompt: string;
+}
+
+export interface TimingEntry {
+  pct: number;
+  label: string;
+  ts: number;  // Unix timestamp (seconds, float)
+}
+
+export interface IllustrationTask {
+  task_id: string;
+  status: "pending" | "running" | "done" | "error";
+  progress: number;
+  label: string;
+  sentence_index: number;
+  chapter_index: number;
+  book_id: string;
+  timings: TimingEntry[];
+  result: IllustrationTaskResult | null;
+  error: string | null;
+}
+
+export async function generateIllustration(params: {
+  text?: string;
+  direct_prompt?: string;
+  character_name?: string;
+  book_id?: string;
+  chapter_index?: number;
+  sentence_index?: number;
+  width?: number;
+  height?: number;
+  seed?: number;
+  prompt_prefix?: string;
+}): Promise<{ task_id: string; queue_position: number }> {
+  const res = await fetch(`${BASE_URL}/illustration/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.detail || "生圖失敗");
+  }
+  return res.json();
+}
+
+export async function getIllustrationProgress(): Promise<IllustrationTask[]> {
+  const res = await fetch(`${BASE_URL}/illustration/progress`);
+  if (!res.ok) return [];
+  return res.json();
+}
+
+export interface IllustrationEngineSettings {
+  steps: number;
+  guidance_scale: number;
+  width: number;
+  height: number;
+  sheet_width: number;
+  sheet_height: number;
+  prompt_prefix: string;
+  ip_adapter_scale: number;
+  hires_fix_enabled: boolean;
+  hires_upscale: number;
+  hires_denoise: number;
+  adetailer_enabled: boolean;
+  adetailer_denoise: number;
+  active_loras: { filename: string; weight: number; enabled: boolean }[];
+  negative_prompt: string;
+}
+
+export interface LoraInfo {
+  filename: string;
+  size_mb: number;
+}
+
+export async function listLoras(): Promise<LoraInfo[]> {
+  const res = await fetch(`${BASE_URL}/illustration/loras`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.loras ?? [];
+}
+
+export async function getIllustrationSettings(): Promise<IllustrationEngineSettings> {
+  const res = await fetch(`${BASE_URL}/illustration/settings`);
+  if (!res.ok) throw new Error("取得繪圖設定失敗");
+  return res.json();
+}
+
+export async function patchIllustrationSettings(patch: Partial<IllustrationEngineSettings>): Promise<void> {
+  await fetch(`${BASE_URL}/illustration/settings`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+}
+
+export async function getChapterIllustrations(bookId: string, chapterIndex: number): Promise<
+  Array<{ id: number; sentence_index: number; prompt: string; image_url: string } & IllustrationMeta>
+> {
+  const res = await fetch(`${BASE_URL}/illustration/list/${bookId}/${chapterIndex}`);
+  if (!res.ok) throw new Error("取得章節插圖失敗");
+  return res.json();
+}
+
+export async function deleteIllustration(illustrationId: number): Promise<void> {
+  await fetch(`${BASE_URL}/illustration/item/${illustrationId}`, { method: "DELETE" });
+}
+
+export async function extractCharacterFeatures(
+  bookId: string,
+  text: string,
+): Promise<Partial<Character>[]> {
+  const res = await fetch(`${BASE_URL}/illustration/extract_character`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, book_id: bookId }),
+  });
+  if (!res.ok) throw new Error("提取角色特徵失敗");
+  return res.json();
+}
+
+export async function getCharacters(bookId: string): Promise<Character[]> {
+  const res = await fetch(`${BASE_URL}/illustration/characters/${bookId}`);
+  if (!res.ok) throw new Error("取得角色庫失敗");
+  return res.json();
+}
+
+export async function upsertCharacter(bookId: string, char: Partial<Character> & { name: string }): Promise<void> {
+  const res = await fetch(`${BASE_URL}/illustration/characters/${bookId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(char),
+  });
+  if (!res.ok) throw new Error("儲存角色失敗");
+}
+
+export async function addCharacterImage(bookId: string, name: string, body: {
+  image_base64: string;
+  angle: string;
+  is_primary?: boolean;
+}): Promise<{ id: number }> {
+  const res = await fetch(
+    `${BASE_URL}/illustration/characters/${bookId}/images?name=${encodeURIComponent(name)}`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+  );
+  if (!res.ok) throw new Error("新增角色圖片失敗");
+  return res.json();
+}
+
+export async function deleteCharacterImage(bookId: string, _name: string, imgId: number): Promise<void> {
+  await fetch(
+    `${BASE_URL}/illustration/characters/${bookId}/image/${imgId}`,
+    { method: "DELETE" }
+  );
+}
+
+export async function setPrimaryCharacterImage(bookId: string, _name: string, imgId: number): Promise<void> {
+  await fetch(
+    `${BASE_URL}/illustration/characters/${bookId}/set_primary/${imgId}`,
+    { method: "POST" }
+  );
+}
+
+export async function getCharacterImage(bookId: string, _name: string, imgId: number): Promise<{ image_url: string; angle: string }> {
+  const res = await fetch(
+    `${BASE_URL}/illustration/characters/${bookId}/image/${imgId}`
+  );
+  if (!res.ok) throw new Error("取得圖片失敗");
+  return res.json();
+}
+
+export function charImageUrl(imgId: number): string {
+  return `${BASE_URL}/illustration/char-image/${imgId}`;
+}
+
+export function illustrationImageUrl(illustrationId: number): string {
+  return `${BASE_URL}/illustration/image/${illustrationId}`;
+}
+
+export async function deleteCharacter(bookId: string, name: string): Promise<void> {
+  const res = await fetch(
+    `${BASE_URL}/illustration/characters/${bookId}?name=${encodeURIComponent(name)}`,
+    { method: "DELETE" }
+  );
+  if (!res.ok) throw new Error("刪除角色失敗");
+}
+
+// ─── 角色去重合併 ─────────────────────────────────────────────────────────────
+
+export interface DedupResult {
+  merged: number;
+  groups: { canonical: string; aliases: string[] }[];
+}
+
+export async function fillCharacterDefaults(bookId: string): Promise<{ updated: number; total: number }> {
+  const res = await fetch(
+    `${BASE_URL}/illustration/characters/${bookId}/fill_defaults`,
+    { method: "POST" }
+  );
+  if (!res.ok) throw new Error("補完欄位失敗");
+  return res.json();
+}
+
+export async function batchDeleteCharacters(bookId: string, names: string[]): Promise<{ deleted: number }> {
+  const res = await fetch(
+    `${BASE_URL}/illustration/characters/${bookId}/batch_delete`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ names }),
+    }
+  );
+  if (!res.ok) throw new Error("批次刪除失敗");
+  return res.json();
+}
+
+export async function dedupCharacters(bookId: string): Promise<DedupResult> {
+  const res = await fetch(
+    `${BASE_URL}/illustration/characters/${bookId}/dedup`,
+    { method: "POST" }
+  );
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.detail || "整理失敗");
+  }
+  return res.json();
+}
+
+// ─── 全書角色分析 ─────────────────────────────────────────────────────────────
+
+export interface AnalysisJob {
+  status: "pending" | "running" | "done" | "error";
+  progress: number;
+  label: string;
+  result: { added: number; total: number } | null;
+  error: string | null;
+}
+
+export async function analyzeCharacters(
+  bookId: string,
+  opts?: { maxChapters?: number; restart?: boolean }
+): Promise<void> {
+  const url = new URL(`${BASE_URL}/illustration/analyze_characters/${bookId}`);
+  if (opts?.maxChapters && opts.maxChapters > 0) {
+    url.searchParams.set("max_chapters", String(opts.maxChapters));
+  }
+  if (opts?.restart) {
+    url.searchParams.set("restart", "true");
+  }
+  const res = await fetch(url.toString(), { method: "POST" });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.detail || "啟動分析失敗");
+  }
+}
+
+export async function getAnalysisStatus(bookId: string): Promise<AnalysisJob | null> {
+  const res = await fetch(`${BASE_URL}/illustration/analyze_characters/${bookId}/status`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error("取得分析狀態失敗");
+  return res.json();
+}
+
+export async function getAnalysisCheckpoint(
+  bookId: string
+): Promise<{ completed_chapters: number[]; count: number }> {
+  const res = await fetch(
+    `${BASE_URL}/illustration/analyze_characters/${bookId}/checkpoint`
+  );
+  if (!res.ok) return { completed_chapters: [], count: 0 };
+  return res.json();
+}
+
+// ─── 多視角批次生圖 ───────────────────────────────────────────────────────────
+
+export interface AngleJob {
+  status: "pending" | "running" | "done" | "error";
+  progress: number;
+  label: string;
+  done: number;
+  total: number;
+  error: string | null;
+}
+
+export async function generateCharacterAngles(
+  bookId: string,
+  name: string,
+  width?: number,
+  height?: number,
+  promptPrefix?: string,
+): Promise<{ job_id: string }> {
+  const res = await fetch(
+    `${BASE_URL}/illustration/characters/${bookId}/generate_angles`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name,
+        ...(width        ? { width }         : {}),
+        ...(height       ? { height }        : {}),
+        ...(promptPrefix !== undefined ? { prompt_prefix: promptPrefix } : {}),
+      }),
+    }
+  );
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.detail || "生成多視角失敗");
+  }
+  return res.json();
+}
+
+export async function getAngleJobStatus(jobId: string): Promise<AngleJob | null> {
+  const res = await fetch(`${BASE_URL}/illustration/angle_jobs/${jobId}`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error("取得生成狀態失敗");
+  return res.json();
+}
+
 export interface ModelStatus {
   id: string;
   name: string;
@@ -310,3 +749,4 @@ export async function unloadModel(): Promise<void> {
     throw new Error(err.detail || "卸載模型失敗");
   }
 }
+

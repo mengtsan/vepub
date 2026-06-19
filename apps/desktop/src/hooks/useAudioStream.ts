@@ -1,8 +1,10 @@
 import { useEffect, useRef, useCallback } from "react";
+import { toast } from "sonner";
 import { usePlayerStore } from "@/stores/player";
+import { useReaderStore } from "@/stores/reader";
 
-const BACKEND_WS = "ws://127.0.0.1:8765/v1/audio/stream";
-const PREFETCH = 3;
+import { BACKEND_WS_URL, PREFETCH } from "@/lib/constants";
+const BACKEND_WS = `${BACKEND_WS_URL}/v1/audio/stream`;
 const SAMPLE_RATE = 24000;
 
 export function useAudioStream(onChapterEnded?: () => void) {
@@ -10,22 +12,26 @@ export function useAudioStream(onChapterEnded?: () => void) {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
   const nextPlayTimeRef = useRef<number>(0);
-  const sentQueueRef = useRef<number[]>([]);   // 紀錄已送出待合成的句子 index 佇列
-  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]); // 紀錄目前正在播放的音訊源節點
+  const sentQueueRef = useRef<number[]>([]);
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const hasSentLastSentenceRef = useRef<boolean>(false);
-  
+
   // 實體音訊高亮同步與手動跳轉控制 refs
   const highlightTimeoutIdsRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   const lastScheduledIndexRef = useRef<number | null>(null);
   const currentReceivingIndexRef = useRef<number | null>(null);
   const isAutoTickingRef = useRef<boolean>(false);
 
+  // §5.4 WS 協定：request_id 過濾與 cancel 支援
+  const reqSeqRef = useRef<number>(0);
+  const currentRequestIdRef = useRef<string | null>(null);
+  const ignoringChunksRef = useRef<boolean>(false);
+
   const {
     isPlaying,
     sentences,
     currentSentenceIndex,
     speed,
-    voice,
     ttsMode,
     refAudioPath,
     refText,
@@ -44,7 +50,7 @@ export function useAudioStream(onChapterEnded?: () => void) {
     audioCtxRef.current = ctx;
 
     const gainNode = ctx.createGain();
-    gainNode.gain.value = 0.8; // 預設 80% 音量
+    gainNode.gain.value = useReaderStore.getState().volume / 100;
     gainNode.connect(ctx.destination);
     gainNodeRef.current = gainNode;
 
@@ -65,23 +71,27 @@ export function useAudioStream(onChapterEnded?: () => void) {
     activeSourcesRef.current = [];
     nextPlayTimeRef.current = 0;
 
-    // 清理高亮排程與狀態
     highlightTimeoutIdsRef.current.forEach(clearTimeout);
     highlightTimeoutIdsRef.current = [];
     lastScheduledIndexRef.current = null;
   }, []);
 
-  // 發送句子給後端進行語音合成（攜帶完整語音模式設定）
+  // 發送句子給後端進行語音合成，攜帶遞增 request_id
   const sendSentence = useCallback((ws: WebSocket, index: number) => {
     if (index >= sentences.length) return;
     if (ws.readyState !== WebSocket.OPEN) return;
 
-    // 根據語音模式決定要傳遞的參數
+    reqSeqRef.current += 1;
+    const request_id = String(reqSeqRef.current);
+    currentRequestIdRef.current = request_id;
+    ignoringChunksRef.current = false;
+
     const payload: Record<string, unknown> = {
       text: sentences[index].text,
       sentence_index: index,
       speed,
       num_step: numStep,
+      request_id,
     };
 
     if (ttsMode === "clone" && refAudioPath) {
@@ -99,30 +109,47 @@ export function useAudioStream(onChapterEnded?: () => void) {
     sentQueueRef.current.push(index);
   }, [sentences, speed, ttsMode, refAudioPath, refText, instruct, numStep, duration]);
 
-  // 處理文字訊息同步（sentence_start/end）
+  // 處理文字訊息（sentence_start/end/cancelled/error），依 request_id 過濾過期回應
   const handleTextMessage = useCallback((msg: any, ws: WebSocket) => {
     if (msg.type === "sentence_start") {
-      // 記錄當前正在接收 PCM 的句子索引，但不直接更新高亮（等 PCM 播放時才更新）
+      if (msg.request_id && msg.request_id !== currentRequestIdRef.current) {
+        // 此 start 屬於已過期請求，忽略後續 PCM chunks
+        ignoringChunksRef.current = true;
+        return;
+      }
+      ignoringChunksRef.current = false;
       currentReceivingIndexRef.current = msg.index;
     }
     if (msg.type === "sentence_end") {
+      if (msg.request_id && msg.request_id !== currentRequestIdRef.current) {
+        return;  // 過期
+      }
       if (msg.index === sentences.length - 1) {
         hasSentLastSentenceRef.current = true;
       }
-      // 獲取目前發送隊列中的最後一個句子索引，並發送其後下一句，維持快取緩衝
       const lastSent = sentQueueRef.current[sentQueueRef.current.length - 1] ?? msg.index;
       if (lastSent + 1 < sentences.length) {
         sendSentence(ws, lastSent + 1);
       }
     }
+    if (msg.type === "cancelled") {
+      // 後端確認 cancel 生效，不需要做任何事
+      return;
+    }
+    if (msg.type === "error") {
+      console.error("[WS] 後端回傳錯誤:", msg.message);
+      toast.error(msg.message || "語音合成發生錯誤");
+    }
   }, [sentences, sendSentence]);
 
   // 處理收到的 PCM 音訊二進位資料並排程播放
   const handlePCMChunk = useCallback(async (buffer: ArrayBuffer, sentenceIndex: number) => {
+    // 若當前接收的是過期請求的資料，直接丟棄
+    if (ignoringChunksRef.current) return;
+
     const ctx = audioCtxRef.current;
     if (!ctx) return;
 
-    // 當開始播放 PCM 時，確保 loading 結束
     setIsLoading(false);
 
     if (ctx.state === "suspended") {
@@ -132,7 +159,6 @@ export function useAudioStream(onChapterEnded?: () => void) {
     const int16 = new Int16Array(buffer);
     const float32 = new Float32Array(int16.length);
 
-    // 將 PCM 16-bit 轉成 Web Audio API 需要的 float32 (-1.0 ~ 1.0)
     for (let i = 0; i < int16.length; i++) {
       float32[i] = int16[i] / 32768.0;
     }
@@ -142,31 +168,26 @@ export function useAudioStream(onChapterEnded?: () => void) {
 
     const source = ctx.createBufferSource();
     source.buffer = audioBuffer;
-    
-    // 連接至實體 GainNode 以實現音量調節，若無則降級連接至預設 destination
+
     if (gainNodeRef.current) {
       source.connect(gainNodeRef.current);
     } else {
       source.connect(ctx.destination);
     }
 
-    // 紀錄此節點以便在暫停時能立即中斷
     activeSourcesRef.current.push(source);
     source.onended = () => {
       activeSourcesRef.current = activeSourcesRef.current.filter((s) => s !== source);
-      // 若最後一句發送完成，且所有音軌都播完了，則觸發章節結束回調
       if (hasSentLastSentenceRef.current && activeSourcesRef.current.length === 0) {
         hasSentLastSentenceRef.current = false;
         onChapterEnded?.();
       }
     };
 
-    // 無縫接續播放：若 nextPlayTime 小於當前時間，則立刻開始播放
     const startTime = Math.max(nextPlayTimeRef.current, ctx.currentTime);
     source.start(startTime);
     nextPlayTimeRef.current = startTime + audioBuffer.duration;
 
-    // 排程實體播放時的高亮更新
     if (sentenceIndex !== null && sentenceIndex !== lastScheduledIndexRef.current) {
       lastScheduledIndexRef.current = sentenceIndex;
       const delayMs = Math.max(0, (startTime - ctx.currentTime) * 1000);
@@ -176,21 +197,21 @@ export function useAudioStream(onChapterEnded?: () => void) {
       }, delayMs);
       highlightTimeoutIdsRef.current.push(timeoutId);
     }
-  }, [onChapterEnded, _setCurrentIndex]);
+  }, [onChapterEnded, _setCurrentIndex, setIsLoading]);
 
   const connectAndPlay = useCallback(() => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
 
-    // 清空舊的排程資訊
     stopAllAudio();
     sentQueueRef.current = [];
     hasSentLastSentenceRef.current = false;
-    
-    // 開始建立連線與語音合成，進入 loading 狀態
+    ignoringChunksRef.current = false;
+    currentRequestIdRef.current = null;
+
     setIsLoading(true);
 
     const ws = new WebSocket(BACKEND_WS);
-    ws.binaryType = "arraybuffer"; // 設定直接返回 ArrayBuffer
+    ws.binaryType = "arraybuffer";
     wsRef.current = ws;
     setWs(ws);
 
@@ -199,8 +220,8 @@ export function useAudioStream(onChapterEnded?: () => void) {
     }
 
     ws.onopen = () => {
-      // 建立連線後，一口氣送出當前句以及預取緩衝句
-      const startIdx = currentSentenceIndex;
+      // 從 store 即時讀取，避免 closure 捕捉到舊的 currentSentenceIndex
+      const startIdx = usePlayerStore.getState().currentSentenceIndex;
       console.log("[WS] 連線已建立，開始發送起始句子索引:", startIdx);
       for (let i = startIdx; i < Math.min(startIdx + PREFETCH, sentences.length); i++) {
         sendSentence(ws, i);
@@ -215,8 +236,6 @@ export function useAudioStream(onChapterEnded?: () => void) {
           console.error("解析 WebSocket 文字訊息失敗:", e);
         }
       } else {
-        // 二進位影格，此時 event.data 直接是 ArrayBuffer
-        // 同步綁定當前正在接收的句子索引，防止被後續非同步訊息覆蓋
         const sentenceIndex = currentReceivingIndexRef.current;
         if (sentenceIndex !== null) {
           handlePCMChunk(event.data, sentenceIndex);
@@ -235,7 +254,7 @@ export function useAudioStream(onChapterEnded?: () => void) {
       setWs(null);
       setIsLoading(false);
     };
-  }, [currentSentenceIndex, sentences, sendSentence, handleTextMessage, handlePCMChunk, stopAllAudio, setWs]);
+  }, [sentences, sendSentence, handleTextMessage, handlePCMChunk, stopAllAudio, setWs, setIsLoading]);
 
   const resumeAudio = useCallback(async () => {
     const ctx = audioCtxRef.current;
@@ -286,22 +305,29 @@ export function useAudioStream(onChapterEnded?: () => void) {
       return;
     }
 
-    // 若不是自動更新，說明是使用者手動點選了其他句子
+    // 使用者手動跳轉：優先用 cancel 訊息取代關閉 WS 重連
     console.log("[useAudioStream] 偵測到使用者手動跳轉至句子:", currentSentenceIndex);
-    
-    if (wsRef.current) {
-      try {
-        wsRef.current.close();
-      } catch (e) {}
-      wsRef.current = null;
-    }
+
     stopAllAudio();
-    connectAndPlay();
-  }, [currentSentenceIndex, isPlaying, connectAndPlay, stopAllAudio]);
+    sentQueueRef.current = [];
+    hasSentLastSentenceRef.current = false;
+
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      // 送出 cancel，後端停止當前合成；直接在既有連線上送新請求
+      ws.send(JSON.stringify({ type: "cancel" }));
+      setIsLoading(true);
+      const startIdx = usePlayerStore.getState().currentSentenceIndex;
+      for (let i = startIdx; i < Math.min(startIdx + PREFETCH, sentences.length); i++) {
+        sendSentence(ws, i);
+      }
+    } else {
+      connectAndPlay();
+    }
+  }, [currentSentenceIndex, isPlaying, sentences, sendSentence, connectAndPlay, stopAllAudio, setIsLoading]);
 
   return {
     resumeAudio,
     changeVolume,
   };
 }
-

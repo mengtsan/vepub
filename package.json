@@ -1,0 +1,12 @@
+{
+  "name": "vepub",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently --kill-others -n \"backend,tauri\" -c \"cyan,magenta\" \"npm run dev:backend\" \"npm run dev:tauri\"",
+    "dev:backend": "cd backend && uv sync --quiet && uv run uvicorn main:app --reload --reload-dir . --reload-exclude .venv --reload-exclude __pycache__ --port 8765",
+    "dev:tauri": "cd apps/desktop && npm run tauri dev"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

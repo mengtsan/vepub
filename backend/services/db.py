@@ -28,9 +28,14 @@ def init_db():
       cover_base64  TEXT,
       file_path     TEXT NOT NULL,
       chapter_count INTEGER DEFAULT 0,
+      file_hash     TEXT,
       created_at    INTEGER DEFAULT (strftime('%s', 'now'))
     );
     """)
+    # migration：為已存在的資料庫補 file_hash 欄位
+    existing_cols = {row[1] for row in cursor.execute("PRAGMA table_info(books)").fetchall()}
+    if "file_hash" not in existing_cols:
+        cursor.execute("ALTER TABLE books ADD COLUMN file_hash TEXT")
 
     # 2. 建立閱讀進度資料表
     cursor.execute("""
@@ -84,8 +89,8 @@ def get_db_connection():
     """
     獲取資料庫連線，並設定 row_factory 以回傳 dict 格式資料。
     """
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
     conn.row_factory = sqlite3.Row
-    # 啟用外鍵約束
+    conn.execute("PRAGMA journal_mode=WAL;")   # 允許並發讀寫，避免 database is locked
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn

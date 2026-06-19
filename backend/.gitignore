@@ -8,3 +8,18 @@ wheels/
 
 # Virtual environments
 .venv
+
+# LLM server binary（約 524 MB，勿 commit）
+llama_bin/
+
+# HuggingFace 模型 config 快取（本機自動下載，勿 commit）
+.wan_cache/
+.zimage_cache/
+
+# 下載的模型檔案
+models/image/
+models/llm/
+models/tts/
+
+# API tokens / credentials
+civitai_token.json

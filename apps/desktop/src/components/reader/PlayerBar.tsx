@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { usePlayerStore } from "@/stores/player";
+import { useReaderStore } from "@/stores/reader";
 import {
   Play,
   Pause,
@@ -9,8 +10,11 @@ import {
   ChevronLeft,
   Volume2,
   Loader2,
+  Bookmark,
+  ImagePlus,
 } from "lucide-react";
 import HardwareBadge from "./HardwareBadge";
+import type { IllustrationTask } from "@/lib/api";
 
 interface PlayerBarProps {
   onSkipNextChapter: () => void;
@@ -18,6 +22,8 @@ interface PlayerBarProps {
   chapterTitle: string;
   resumeAudio: () => void;
   changeVolume: (volume: number) => void;
+  onBookmark?: () => void;
+  illustrationTasks?: IllustrationTask[];
 }
 
 export default function PlayerBar({
@@ -26,6 +32,8 @@ export default function PlayerBar({
   chapterTitle,
   resumeAudio,
   changeVolume,
+  onBookmark,
+  illustrationTasks = [],
 }: PlayerBarProps) {
   const {
     isPlaying,
@@ -42,7 +50,7 @@ export default function PlayerBar({
 
   const [opacity, setOpacity] = useState(1);
   const hoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [volume, setVolume] = useState(80); // 音量控制 (0 ~ 100)
+  const { volume, setVolume } = useReaderStore();
 
   // 當元件載入或 changeVolume 改變時，初始化實體音量
   useEffect(() => {
@@ -59,14 +67,18 @@ export default function PlayerBar({
     setSpeed(speedList[nextIndex]);
   };
 
+  // 生圖進度摘要：semaphore=1，同時只有一個 running，其餘 pending
+  const hasActiveIllustration = illustrationTasks.length > 0;
+  const runningTask = illustrationTasks.find((t) => t.status === "running") ?? illustrationTasks[0];
+
   // 滑鼠靜止與移出自動淡出邏輯
   const resetFadeTimer = () => {
     setOpacity(1);
     if (hoverTimeoutRef.current) {
       clearTimeout(hoverTimeoutRef.current);
     }
-    // 只有在朗讀播放時才進行淡出，暫停時維持清晰
-    if (isPlaying) {
+    // 只有在朗讀播放且無生圖任務進行時才淡出，暫停或生圖中維持清晰
+    if (isPlaying && !hasActiveIllustration) {
       hoverTimeoutRef.current = setTimeout(() => {
         setOpacity(0.15); // 淡出為超低不透明度
       }, 3000);
@@ -78,7 +90,7 @@ export default function PlayerBar({
     return () => {
       if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
     };
-  }, [isPlaying]);
+  }, [isPlaying, hasActiveIllustration]);
 
   return (
     <div
@@ -88,7 +100,7 @@ export default function PlayerBar({
         if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current);
       }}
       onMouseLeave={() => {
-        if (isPlaying) {
+        if (isPlaying && !hasActiveIllustration) {
           hoverTimeoutRef.current = setTimeout(() => {
             setOpacity(0.15);
           }, 1500); // 移出時稍微加速淡出
@@ -189,8 +201,8 @@ export default function PlayerBar({
           value={volume}
           onChange={(e) => {
             const val = parseInt(e.target.value);
-            setVolume(val);
             changeVolume(val);
+            setVolume(val);
           }}
           className="w-16 h-0.5 rounded bg-white/20 accent-amber-500 outline-none cursor-pointer"
           title={`音量: ${volume}%`}
@@ -202,7 +214,43 @@ export default function PlayerBar({
         {chapterTitle}
       </div>
 
-      {/* 5. 硬體指示徽章 */}
+      {/* 5. 書籤按鈕 */}
+      {onBookmark && (
+        <button
+          onClick={onBookmark}
+          className="p-1.5 rounded-full hover:bg-white/10 active:scale-90 transition-all"
+          title="加入書籤（目前位置）"
+          style={{ color: "var(--text-secondary)" }}
+        >
+          <Bookmark size={15} />
+        </button>
+      )}
+
+      {/* 6. 生圖進度（有任務時顯示，含排隊數量與當前進度） */}
+      {hasActiveIllustration && runningTask && (
+        <div className="flex items-center gap-2 border-l pl-3" style={{ borderColor: "var(--border)" }} title={runningTask.label}>
+          <div className="relative flex items-center">
+            <ImagePlus size={15} className="text-amber-500" />
+            <span className="absolute -top-2 -right-2 px-1 rounded-full text-[9px] font-bold bg-amber-500 text-black leading-none min-w-[14px] text-center">
+              {illustrationTasks.length}
+            </span>
+          </div>
+          <div className="hidden md:flex flex-col gap-0.5 w-28">
+            <div className="flex items-center justify-between text-[9px] leading-none" style={{ color: "var(--text-secondary)" }}>
+              <span className="truncate pr-1">{runningTask.label}</span>
+              <span>{runningTask.progress}%</span>
+            </div>
+            <div className="h-1 rounded-full overflow-hidden" style={{ backgroundColor: "var(--border)" }}>
+              <div
+                className="h-full rounded-full bg-amber-500 transition-all duration-300"
+                style={{ width: `${runningTask.progress}%` }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 7. 硬體指示徽章 */}
       <div className="pl-1">
         <HardwareBadge />
       </div>
