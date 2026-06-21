@@ -24,6 +24,10 @@ class IllustrationSettings(BaseModel):
     height: int           = 1024
     sheet_width: int      = 832
     sheet_height: int     = 1216
+    # 手動覆寫 Turbo / Z-Image 的步數與 CFG：預設 False → 沿用官方自動值（Turbo 8 步、
+    # Z-Image 基礎 28 步，CFG 各架構建議值）；True → 步數與 CFG 皆改用上面的 steps /
+    # guidance_scale（Z-Image Turbo CFG>1 會退化，屬手動控制的自負風險）。
+    turbo_override: bool  = False
     prompt_prefix: str    = (
         "score_9, score_8_up, score_7_up, score_6_up, illustration, "
         "soft shading, detailed shading, colorful, "
@@ -38,6 +42,15 @@ class IllustrationSettings(BaseModel):
     adetailer_enabled: bool  = True
     adetailer_denoise: float = 0.4   # 0.3 保守 / 0.45 明顯重繪
     active_loras: list[LoraEntry] = []
+    # 輔助模型——皆以「掃描 models/<dir>/ 實際檔案」為準（目錄沒有就不會出現可設定項）。
+    # active_embeddings：啟用的 Textual Inversion 檔名清單；空 = 載入目錄內全部（保留現狀）。
+    active_embeddings: list[str] = []
+    # active_vae：選用的 VAE 檔名（models/vae/ 下）；空 = 使用模型內建 / 各模型自帶的 vae_path。
+    active_vae: str       = ""
+    # 單一模型模式：True = 一律使用 registry 的 image.active 模型生圖（不分 anime/real），
+    # 提示詞形式跟著該模型的架構（SDXL 標籤 / Z-Image 散文）；anime/real 只影響風格語氣。
+    # False（預設）= 維持雙模型依場景自動切換。
+    single_model_mode: bool = False
     negative_prompt: str  = (
         "score_5, score_4, score_3, score_2, score_1, "
         "worst quality, bad quality, lowres, jpeg artifacts, blurry, deformed, "

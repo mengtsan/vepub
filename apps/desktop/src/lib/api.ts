@@ -383,6 +383,7 @@ export interface IllustrationEngineSettings {
   height: number;
   sheet_width: number;
   sheet_height: number;
+  turbo_override: boolean;
   prompt_prefix: string;
   ip_adapter_scale: number;
   hires_fix_enabled: boolean;
@@ -391,6 +392,9 @@ export interface IllustrationEngineSettings {
   adetailer_enabled: boolean;
   adetailer_denoise: number;
   active_loras: { filename: string; weight: number; enabled: boolean }[];
+  active_embeddings: string[];
+  active_vae: string;
+  single_model_mode: boolean;
   negative_prompt: string;
 }
 
@@ -404,6 +408,20 @@ export async function listLoras(): Promise<LoraInfo[]> {
   if (!res.ok) return [];
   const data = await res.json();
   return data.loras ?? [];
+}
+
+export async function listEmbeddings(): Promise<LoraInfo[]> {
+  const res = await fetch(`${BASE_URL}/illustration/embeddings`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.embeddings ?? [];
+}
+
+export async function listVaes(): Promise<LoraInfo[]> {
+  const res = await fetch(`${BASE_URL}/illustration/vaes`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.vaes ?? [];
 }
 
 export async function getIllustrationSettings(): Promise<IllustrationEngineSettings> {

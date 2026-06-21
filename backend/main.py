@@ -12,7 +12,7 @@ if hasattr(sys.stderr, "reconfigure"):
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import tts, epub, health, models, illustration, characters
+from routers import tts, epub, health, models, illustration, characters, llm
 from config import BACKEND_PORT
 from routers.illustration_common import init_illustration_tables
 from services.hardware_detector import detect_hardware
@@ -70,6 +70,7 @@ app.include_router(health.router, prefix="/health")
 app.include_router(tts.router, prefix="/v1/audio")
 app.include_router(epub.router, prefix="/epub")
 app.include_router(models.router, prefix="/v1/models")
+app.include_router(llm.router, prefix="/v1/llm")
 app.include_router(illustration.router, prefix="/illustration")
 app.include_router(characters.router, prefix="/illustration")
 

@@ -211,19 +211,34 @@ async def serve_char_image(img_id: int):
     raise HTTPException(status_code=404, detail="圖片資料不存在")
 
 
-@router.get("/loras")
-async def list_loras():
+def _scan_asset_dir(subdir: str, suffixes=(".safetensors", ".bin", ".pt")) -> list[dict]:
+    """掃描 models/<subdir>/ 下的權重檔，回傳 [{filename, size_mb}]。目錄不存在則空清單。"""
     from config import MODELS_DIR
-    loras_dir = MODELS_DIR / "loras"
-    loras = []
-    if loras_dir.exists():
-        for f in sorted(loras_dir.iterdir()):
-            if f.suffix in (".safetensors", ".bin", ".pt"):
-                loras.append({
+    d = MODELS_DIR / subdir
+    out = []
+    if d.exists():
+        for f in sorted(d.iterdir()):
+            if f.suffix in suffixes and f.is_file():
+                out.append({
                     "filename": f.name,
                     "size_mb":  round(f.stat().st_size / 1024 / 1024, 1),
                 })
-    return {"loras": loras}
+    return out
+
+
+@router.get("/loras")
+async def list_loras():
+    return {"loras": _scan_asset_dir("loras")}
+
+
+@router.get("/embeddings")
+async def list_embeddings():
+    return {"embeddings": _scan_asset_dir("embeddings")}
+
+
+@router.get("/vaes")
+async def list_vaes():
+    return {"vaes": _scan_asset_dir("vae", suffixes=(".safetensors", ".pt", ".ckpt"))}
 
 
 @router.get("/status")

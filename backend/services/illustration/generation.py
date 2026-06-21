@@ -14,6 +14,7 @@ ProgressCallback = Callable[[int, str], None]
 from services.illustration.settings import get_settings
 from services.illustration.prompt_builder import (
     build_character_fragment, build_character_fragment_en,
+    build_character_description_zimage,
     _expand_prompt, _infer_is_anime, character_seed_for,
     _build_negative_prompt, _build_negative_prompt_sheet,
 )
@@ -137,10 +138,18 @@ async def generate_character_sheet(
 
     is_anime   = _infer_is_anime(prompt_prefix)
     user_style = prompt_prefix.strip()
+    _style_key = "anime" if is_anime else "real"
+    _arch      = _active_model_arch(_style_key)
 
-    # BREAK 分段：W1=角色外觀（身份），W2=構圖+風格/品質。各段在獨立的 77-token
-    # 窗口編碼（見 _encode_with_break），避免長 prompt 把構圖/風格整段截斷丟掉。
-    if is_anime:
+    # 先架構分形態：Z-Image 走自然語言散文；SDXL 走 danbooru 標籤 + BREAK 分窗。
+    if _arch == "zimage":
+        desc  = build_character_description_zimage(char_data) if char_data else (character_desc + "。")
+        style = "動漫插畫風格，色彩鮮明、線條乾淨" if is_anime else "寫實攝影，自然光影、細節豐富"
+        extra = (user_style + "。") if user_style else ""
+        prompt = f"{style}。{desc}全身像，站姿，面向鏡頭，簡潔純色背景。{extra}"
+    elif is_anime:
+        # BREAK 分段：W1=角色外觀（身份），W2=構圖+風格/品質。各段在獨立的 77-token
+        # 窗口編碼（見 _encode_with_break），避免長 prompt 把構圖/風格整段截斷丟掉。
         en_tags   = build_character_fragment_en(char_data, seed=seed, include_expression=True) if char_data else character_desc
         char_part = en_tags.strip()
         if user_style:
@@ -178,8 +187,6 @@ async def generate_character_sheet(
 
     loop = asyncio.get_running_loop()
     from services.gpu_manager import gpu_manager
-    _style_key = "anime" if is_anime else "real"
-    _arch = _active_model_arch(_style_key)
     _task = "illustration_sdxl" if _arch == "sdxl" else "illustration_zimage"
     await gpu_manager.acquire_gpu(_task)
     try:
@@ -252,9 +259,17 @@ async def generate_portrait(
 
     is_anime   = _infer_is_anime(prompt_prefix)
     user_style = prompt_prefix.strip()
+    _style_key = "anime" if is_anime else "real"
+    _arch      = _active_model_arch(_style_key)
 
-    # BREAK 分段：W1=角色外觀，W2=構圖+風格/品質（同 generate_character_sheet）。
-    if is_anime:
+    # 先架構分形態：Z-Image 自然語言散文；SDXL danbooru 標籤 + BREAK 分窗。
+    if _arch == "zimage":
+        desc  = build_character_description_zimage(char_data) if char_data else (character_desc + "。")
+        style = "動漫插畫風格，色彩鮮明、線條乾淨" if is_anime else "寫實攝影，自然光影、細節豐富"
+        extra = (user_style + "。") if user_style else ""
+        prompt = f"{style}。{desc}上半身像，面向鏡頭，簡潔純色背景。{extra}"
+    elif is_anime:
+        # BREAK 分段：W1=角色外觀，W2=構圖+風格/品質（同 generate_character_sheet）。
         en_tags   = build_character_fragment_en(char_data, seed=seed, include_expression=True) if char_data else character_desc
         char_part = en_tags.strip()
         if user_style:
@@ -292,8 +307,6 @@ async def generate_portrait(
 
     loop = asyncio.get_running_loop()
     from services.gpu_manager import gpu_manager
-    _style_key = "anime" if is_anime else "real"
-    _arch = _active_model_arch(_style_key)
     _task = "illustration_sdxl" if _arch == "sdxl" else "illustration_zimage"
     await gpu_manager.acquire_gpu(_task)
     try:
@@ -383,19 +396,31 @@ async def generate_illustration(
     if is_direct:
         _cb(25, "直接使用提示詞")
         is_anime    = _infer_is_anime(style_hint) or _infer_is_anime(direct_prompt)
+        target_arch = _active_model_arch("anime" if is_anime else "real")
         full_prompt = direct_prompt.strip()
         primary = _find_text_primary_char(text, character_descriptions or [])
         if primary:
             char_contexts = [primary]
     else:
         _cb(25, "LLM 生成插圖 prompt")
+        # 先粗判風格以決定要載入哪個模型 → 得知架構形態（zimage 句子 / sdxl 標籤）。
+        # 與 _expand_prompt 內部的 _detect_is_anime(style_hint) 同源，結果一致。
+        _pre_is_anime = _infer_is_anime(style_hint)
+        target_arch = _active_model_arch("anime" if _pre_is_anime else "real")
         scene_prompt, is_anime, char_contexts = await _expand_prompt(
             text,
             character_descriptions=character_descriptions,
             style_hint=style_hint,
+            target_arch=target_arch,
         )
-        # 品質詞前置 + LLM 輸出的場景 prompt（兩個 encoder 吃同一份）
-        full_prompt = f"{_quality}, {scene_prompt}" if scene_prompt else _quality
+        if target_arch == "zimage":
+            # Z-Image：scene_prompt 已是含風格錨的自然語言段落，不前置 danbooru 品質詞
+            full_prompt = scene_prompt or (
+                "動漫插畫風格，高品質，細節豐富。" if is_anime else "寫實攝影，高品質，細節豐富。"
+            )
+        else:
+            # 品質詞前置 + LLM 輸出的場景標籤（兩個 CLIP encoder 吃同一份）
+            full_prompt = f"{_quality}, {scene_prompt}" if scene_prompt else _quality
 
     # ── 在場角色解析：FaceID 參考圖／seed 與構圖 prompt 共用同一份判定 ──────────
     # 顯式 character_name（使用者手動選角）優先；否則用 char_contexts[0]

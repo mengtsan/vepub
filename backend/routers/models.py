@@ -58,6 +58,9 @@ async def list_all_models(request: Request):
         models = cat_data.get("models", {})
         result = []
         for mid, info in models.items():
+            # 孤兒條目（缺檔且無下載來源）不顯示；缺檔但可下載的「預設」保留
+            if model_registry._is_orphan(info):
+                continue
             m = dict(info)
             m["id"] = mid
             m["is_active"] = (
@@ -72,6 +75,13 @@ async def list_all_models(request: Request):
                 m["is_loaded"] = (image_backend.model_id == mid)
             else:
                 m["is_loaded"] = False
+            # 檔案是否實際存在於磁碟（登錄但未下載者為 False）
+            m["available"] = model_registry.is_model_available(info)
+            # 圖像模型：即時偵測實際架構（檔名可能誤導），供 UI 標籤顯示
+            if category == "image":
+                from services.illustration.pipelines import inspect_arch
+                m["arch"] = inspect_arch(info.get("local_path", ""))
+                m["is_turbo"] = "turbo" in (info.get("name", "") or mid).lower()
             result.append(m)
         return {"active": active, "models": result}
 
@@ -82,8 +92,9 @@ async def list_all_models(request: Request):
             "chat":     reg.get("llm", {}).get("chat"),
             "analysis": reg.get("llm", {}).get("analysis"),
             "models": [
-                dict(info, id=mid)
+                dict(info, id=mid, available=model_registry.is_model_available(info))
                 for mid, info in reg.get("llm", {}).get("models", {}).items()
+                if not model_registry._is_orphan(info)
             ],
         },
     }
@@ -184,6 +195,9 @@ async def activate_model(category: str, req: ActivateRequest, request: Request):
     info = model_registry.get_model(category, req.model_id)
     if info is None:
         raise HTTPException(status_code=404, detail=f"模型 {req.model_id!r} 不在登錄檔中")
+    # 不允許切換到檔案不存在的模型（與 UI「移除的模型不可選」原則一致）
+    if not model_registry.is_model_available(info):
+        raise HTTPException(status_code=409, detail="模型檔案不存在，請先下載")
 
     # ── LLM：只更新 registry ──────────────────────────────────────────────
     if category == "llm":

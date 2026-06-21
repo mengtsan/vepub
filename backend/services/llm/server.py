@@ -241,6 +241,21 @@ async def _chat(
         payload["frequency_penalty"] = frequency_penalty
     if presence_penalty:
         payload["presence_penalty"] = presence_penalty
+
+    # 全域取樣覆寫（預設關閉）。開啟後以使用者在「模型管理」設定的值取代各呼叫的
+    # 調校參數；max_tokens 留空(None)時不覆寫，避免截斷較長輸出（全書分析等）。
+    try:
+        from services.llm.settings import get_settings as _get_llm_settings
+        _s = _get_llm_settings()
+        if _s.override_enabled:
+            payload["temperature"]    = _s.temperature
+            payload["top_p"]          = _s.top_p
+            payload["top_k"]          = _s.top_k
+            payload["repeat_penalty"] = _s.repeat_penalty
+            if _s.max_tokens is not None:
+                payload["max_tokens"] = _s.max_tokens
+    except Exception:
+        pass
     url = f"http://127.0.0.1:{_SERVER_PORT}/v1/chat/completions"
     async with httpx.AsyncClient() as client:
         resp = await client.post(url, json=payload, timeout=600.0)

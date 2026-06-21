@@ -1,17 +1,32 @@
 {
-  "steps": 30,
-  "guidance_scale": 6.0,
+  "steps": 8,
+  "guidance_scale": 1.0,
   "width": 1024,
   "height": 1024,
   "sheet_width": 832,
   "sheet_height": 1216,
-  "prompt_prefix": "(masterpiece, best quality, highly detailed anime illustration:1.2), Ancient China",
+  "turbo_override": true,
+  "prompt_prefix": "anime style, vibrant colors, clean lineart, highly detailed",
   "ip_adapter_scale": 0.7,
   "hires_fix_enabled": false,
   "hires_upscale": 1.5,
   "hires_denoise": 0.35,
   "adetailer_enabled": true,
   "adetailer_denoise": 0.4,
-  "active_loras": [],
+  "active_loras": [
+    {
+      "filename": "Eyes_High_Definition-000007.safetensors",
+      "weight": 1.0,
+      "enabled": false
+    },
+    {
+      "filename": "TrendCraft_The_Peoples_Style_Detailer-v2.4I-5_18_2025-Illustrious.safetensors",
+      "weight": 1.0,
+      "enabled": false
+    }
+  ],
+  "active_embeddings": [],
+  "active_vae": "",
+  "single_model_mode": false,
   "negative_prompt": "score_5, score_4, score_3, score_2, score_1, worst quality, bad quality, lowres, jpeg artifacts, blurry, deformed, bad anatomy, bad hands, extra limbs, missing limbs, missing fingers, extra fingers, bad eyes, asymmetrical eyes, poorly drawn eyes, text, watermark, signature, flat color, flat shading, monochrome, greyscale, loli, minor, rough sketch, lineart, thick lines, thick outline, dirty lines, messy linework, cel shading, simple shading"
 }

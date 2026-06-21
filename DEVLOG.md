@@ -2,6 +2,203 @@
 
 ---
 
+## 2026-06-21 — 模型管理大整理：常用參數收斂、輔助模型、單一模型模式、架構偵測，與 Turbo 步數 bug
+
+一整輪以「模型設定」為核心的整理與修錯，貫穿後端 routing 與前端 ModelManager / 閱讀器設定面板。
+
+### 1. 模型設定提供常用參數（文字 + 影像）
+
+- **LLM 全域取樣覆寫**（新）：`services/llm/settings.py` + `routers/llm.py`（`GET/PATCH /v1/llm/settings`），`server.py::_chat()` 在 `override_enabled` 時以全域值取代各任務的調校參數（temperature/top_p/top_k/repeat_penalty，max_tokens 留空不覆寫以免截斷全書分析）。**預設關閉**，沿用各任務刻意調過的值。掛在 `/v1/llm` 而非 `/v1/models`，避免和 `PATCH /{category}/{model_id}` 動態路徑衝突。
+- **影像常用參數**：ModelManager 圖像分頁新增 `ImageParamsPanel`（步數、CFG、尺寸、Hires、ADetailer、反向提示詞），共用既有 `/illustration/settings`。
+
+### 2. Turbo `_is_turbo` 從未被設定 → Z-Image Turbo 一直跑 28 步（bug）
+
+`_resolve_effective_params` 用 `getattr(pipe, "_is_turbo", False)` 判定 turbo，但**兩個載入器都沒設 `pipe._is_turbo`**（Z-Image 算了卻只拿去印 log、SDXL 根本沒算）→ turbo 分支是死碼，Z-Image Turbo 跑成 28 步 + CFG 4.0。修正：兩個載入器都補 `pipe._is_turbo`。並新增「**手動覆寫 Turbo / Z-Image 步數與 CFG**」開關（`turbo_override`），預設沿用官方自動值（Turbo 8 步、Z-Image 基礎 28），開啟才改用滑桿；滑桿下限放寬到步數 4、CFG 1.0。
+
+### 3. 模型管理以「磁碟實況」為準（使用者原則）
+
+- `model_registry.is_model_available()`（檔案存在性）+ `verify_registry()` + `normalize_active_pointers()`（啟動時把指向孤兒的 active 導正）。
+- `_is_orphan()` = 缺檔且無 `source`：清單隱藏；缺檔但有下載來源的「預設」保留並在 UI 顯示**下載鈕**（`ModelCard` 用 `model.source` 走既有下載流程）。
+- `/activate` 端點擋下切換到缺檔模型（409）。
+- 移除圖像分頁多餘的「Prompt 優化 LLM」唯讀狀態，LLM 設定統一在語言模型分頁；`角色分析模型` 標籤改為 **`角色分析 / 構圖模型`** 並加說明（它才是負責文章→構圖的模型）。
+
+### 4. 輔助模型（VAE / Embedding / LoRA）依目錄掃描可設定
+
+- `routers/illustration.py` 新增 `/embeddings`、`/vaes`（與 `/loras` 同款掃描）。
+- `IllustrationSettings` 加 `active_embeddings`（空=全載入，保留現狀）、`active_vae`（空=模型內建）。
+- `pipelines.py`：embeddings 改為掃描目錄 + 依啟用清單載入；VAE 優先序 = UI 選的全域 VAE > 模型自帶 > 內建。
+- ModelManager 新增 `AuxModelsPanel`（目錄空則提示放置路徑）。CLIP/text encoder 為 checkpoint 內建（SDXL）或 Qwen3（Z-Image），不需也不該做成可選。
+
+### 5. 介面收斂
+
+生圖設定（步數/CFG/Hires/ADetailer/LoRA/VAE/反向提示詞）統一移至 ModelManager；閱讀器設定面板只保留「閱讀當下的創作快捷」（畫風前綴、固定 Seed）。畫風前綴**依 anime/real 分組並與 ModelManager 的風格打通**——缺對應風格模型時整組停用。
+
+### 6. 「選了 Z-Image 卻得到 SDXL 提示詞」——根因是路由 + 檔名誤導
+
+- **機制**：實際使用的模型由 `is_anime`(anime/real) 路由 `_find_model_entry(style)` 決定，**不是**由 active 直接決定（active 只在風格相符時優先）。提示詞形式跟著實際載入的模型。
+- **使用者選的方案：單一模型模式**（`single_model_mode`，預設關）。開啟後 `_single_model_entry()` 讓 `_find_model_entry`/`_active_model_arch`/`ensure_pipe` 一律指向 `image.active`，不分 anime/real（快取改為只看路徑）；anime/real 只影響語氣。
+- **真相**：檔名會騙人——`zImageTurboNSFW` 檔案其實**遺失**（舊 `_detect_architecture` 讀檔失敗預設回 `sdxl` 造成誤標）；真正的 Z-Image 是 `luciddreamerZ`（active）與 `moodyProMix_zitV13`。
+- **架構標籤**：新增 `inspect_arch()`（檔案不存在/讀不到回 `None`，不誤標 sdxl）；`GET /v1/models/` 圖像模型帶 `arch`/`is_turbo`；`ModelCard` 顯示 `SDXL` / `Z-Image` / `Z-Image·Turbo` 徽章——名字不可靠，看徽章認模型。
+
+### 驗證
+
+- 後端各檔 `ast.parse` 通過；`is_model_available` / `_is_orphan` / `normalize_active_pointers` / `_single_model_entry` / `inspect_arch` 以實際 `model_registry.json` 人工驗證（孤兒隱藏、預設保留、單一模式回 active、arch 正確、缺檔回 None）。
+- 前端 `tsc --noEmit` 僅剩 2 個既有 `IllustrationTest.tsx` 錯誤，本輪改動零錯誤。
+- **未跑 GPU 實機**：`_active_model_arch` 需 diffusers（uv 環境），純 python 無法測該行；建議啟動 dev 後實測單一模型模式 + 架構徽章。
+
+---
+
+## 2026-06-21 — 切換繪圖模型 VRAM 不釋放 + 同風格 activate 切換不生效
+
+### 問題
+
+實機回報：**切換繪圖模型時，VRAM 似乎沒有釋放前一個模型佔用的空間。**
+
+### 根因（`services/illustration/pipelines.py`）
+
+換模型的唯一路徑是 `ensure_pipe(style)`，但它有兩個缺陷：
+
+1. **換模型前沒有先卸載舊 pipe**。原本邏輯是「載入新模型後直接覆寫 `_pipe`」：
+
+   ```python
+   _pipe = await loop.run_in_executor(None, _load_zimage_pipe_sync, ...)  # 直接覆寫
+   _loaded_style = style
+   ```
+
+   - 載入新模型期間舊模型仍在 VRAM → 兩個模型同時佔用（ZImage 21GB ＋另一個直接逼近/超過 25.7GB 上限 → OOM 或爆顯存）。
+   - 覆寫後**完全沒有** `gc.collect()` / `torch.cuda.empty_cache()`；舊 pipe 雖失去引用，但 PyTorch CUDA 配置器不會主動把快取歸還，`nvidia-smi` 看起來就是「沒釋放」。對比之下 `unload_pipe()` / `_unload_pipe_sync()` 都有正確 GC，只是換模型路徑根本沒呼叫到。
+
+2. **快取鍵只用 `style`，沒看模型檔路徑**。`if _pipe is not None and _loaded_style == style: return _pipe` → 同一風格換不同模型檔時，直接回傳舊的 cached pipe，**切了不生效**。
+
+### 修正
+
+| 改動 | 內容 |
+|------|------|
+| 新增 `_loaded_path` 全域 | 記錄目前載入的模型檔路徑，作為快取鍵之一 |
+| `ensure_pipe` 快取鍵 | 改為「風格 ＋ 模型檔路徑」都相符才重用；不符就重載 |
+| `ensure_pipe` 換模型流程 | 載入新模型**前**先 `_unload_pipe_sync()`（卸載舊 pipe ＋ `gc.collect()` ＋ `empty_cache()`），避免新舊同時佔 VRAM、並確實歸還顯存 |
+| `_unload_pipe_sync` / `unload_pipe` | 統一重置 `_loaded_path`，`unload_pipe` 改為呼叫 `_unload_pipe_sync` 共用同一套釋放邏輯 |
+
+> 過程中曾試用 `old.to("cpu")` 再 del 來「保證」搬離 VRAM，但那會把整個模型（ZImage 達 21GB）暫時搬進系統 RAM 造成尖峰且較慢。實際上只要丟掉所有 Python 引用再 `empty_cache()`，配置器就會歸還顯存（diffusers 標準做法），故移除該段。
+
+### 延伸：「同風格下 activate 切換不同模型檔」也生效（`_find_model_entry`）
+
+`_find_model_entry(style)` 原本回傳「**第一個** style 欄位相符的模型」，完全不看 registry 的 `active`；而 image 的 activate 端點（`routers/models.py`）只更新 registry `active`、`_build_image_backend` 回傳 `None`，等於切換鈕對生圖毫無影響。
+
+修正：`_find_model_entry` 改為**優先採用 `active` 模型（僅當其風格與請求風格相符）**，風格不符才回退「第一個該風格模型」。搭配上面的 `_loaded_path` 快取鍵，activate 後下一次生成會自動卸載舊模型並換載新的。
+
+- 以目前 registry（`active = luciddreamerZ`，anime）驗證：`_find_model_entry("anime")` → 回傳 active 的 luciddreamerZ（不再是第一個 janku）；`_find_model_entry("real")` → active 是 anime、風格不符 → 回退唯一的 real（zImageTurbo）。✅
+- **不需改前端 / registry schema**，沿用既有單一 `active` 徽章語意，採 lazy 換載（下次生成才換，與「VRAM 管理 → 預載入/釋放」流程一致）。
+
+### 已知限制 / 設計取捨（刻意未做）
+
+這次是在「**單一 `active` 欄位**」上打的補丁，而生圖風格是**每張圖依文字內容自動判定**（`_infer_is_anime`），一個欄位本質上無法同時表達「anime 用哪個、real 用哪個」。
+
+- **目前資料下完全正確**：使用者只有 1 個 real 模型，real 的「回退第一個」永遠唯一無歧義；anime 三個靠 active 正確選擇。
+- **露餡條件**：當**非 active 的那個風格也有 2 個以上模型**時會出現「另一風格被悄悄重設成第一個」——例：activate anime C 後再 activate real R2，下次 anime 生圖因 active=R2 風格不符而回退到第一個 anime（A），C 被默默丟掉。
+- **真正乾淨的解**：依風格各記一個 active（registry `active_anime` / `active_real`），需動 schema、`GET /models` 的 `is_active` 計算、activate 端點與前端徽章。**結論：等實際加入第二個 real 模型時再升級**，現在做 per-style 的額外複雜度沒有實際回報。
+
+### 驗證
+
+- `python -c "ast.parse(...)"` 語法檢查通過（`pipelines.py`）。
+- 邏輯以目前 `model_registry.json` 內容人工推演正確（見上）。
+- **未跑 GPU 實機**：建議下次啟動 dev 後，在 ModelManager 切換 anime 模型再生一張圖，確認 `nvidia-smi` 顯存回落且輸出換成新模型。
+
+### `_active_model_arch` 的邊界情況（未動）
+
+`_active_model_arch()` 在「已載入同風格 pipe」時會直接回傳**目前已載入 pipe 的架構**來決定 GPU 鎖策略（`illustration_sdxl` vs `illustration_zimage`）。若在**同風格下、於兩個不同架構的模型間切換**（如同為 anime 但一 SDXL 一 Z-Image），切換後「第一次」生成會用舊架構判定鎖，之後才正確。目前 3 個 anime 都是 SDXL 無此問題，故維持原樣以免每次生成都去讀 safetensors 標頭。
+
+---
+
+## 2026-06-20 — 插圖場景 prompt 職責分離重構（根治外觀抄壞/性別錯/性愛幻覺）
+
+### 問題
+
+實機回報插圖「一直出問題」，連續幾種症狀：
+
+1. 原文純對話場景（「樂天披外衣、權力美婦翻臉」），插圖卻生成
+   `doggystyle, vaginal, cum` 等明確性愛標籤。
+2. 多角色場景的標籤黏死：`1girl_mature_female`、`long hair 1girl short hair`、
+   標籤開頭黏 `:`/`-`、整串外觀無逗號。
+3. 明確的女性角色被標成 `middle-aged man`（性別錯）。
+
+逐個補 parser（`_FUSED_COUNT_RE` / `_EMBEDDED_COUNT_RE` / 底線轉空格 / 開頭符號
+strip / 場景解析加 `is_sexual` 欄位）能壓下個案，但症狀換個花樣又冒出來。
+
+### 根因（設計層）
+
+場景插圖 prompt 混了兩種本質不同的資訊，且**兩種都被丟給同一個不可靠的 LLM
+文字生成步驟**：
+
+| | 類型 A：角色固定外觀 | 類型 B：場景語意 |
+|---|---|---|
+| 內容 | 髮色/瞳色/臉型/體型/罩杯/服裝/性別/配件 | 動作、是否性愛+體位、地點、時間、光線、鏡頭 |
+| 來源 | 已存 DB，已有決定性轉換器 `build_character_fragment_en()` | 需 LLM 讀原文 |
+
+舊設計把類型 A 也餵進 `_build_composition_prompt` 要 LLM「抄回來」，最終 prompt
+只有 LLM 那一行（`generation.py` 的 `full_prompt`）；那份乾淨的決定性外觀標籤，
+除非 LLM 一字不差重打，否則到不了圖上。於是每個 bug 都是「LLM 抄壞了它本不該抄
+的東西」：性別錯、黏接、性愛幻覺、塌縮整份外觀消失。下游 parser 修的是「自由格式
+LLM 文字」，失敗面無限，永遠補不完。
+
+### 修正（`services/llm/tasks.py`，職責分離）
+
+```
+最終 prompt = 品質詞, 人數標籤, [各角色外觀片段]  BREAK  [LLM 場景標籤]
+                     └─ 決定性，不經 LLM ─┘            └─ LLM 只負責這段 ─┘
+```
+
+- `_build_composition_prompt` 改成**只輸出類型 B 場景標籤**（prefill `PROMPT: `，
+  不含人數/外觀/角色名）；`_build_char_context_for_scene` 只給 LLM 名字+性別+身分
+  當脈絡，不給外觀。
+- 新增 `_assemble_prompt`：決定性組裝 `_subject_count_tag()` 人數 + 各角色
+  `build_character_fragment_en()`（`_strip_lead_count` 去掉自帶的 1girl 前綴）
+  `BREAK` 場景標籤。`expand_prompt` Step 3 取場景標籤、Step 4 組裝。
+- **BREAK 分窗**：身份段與場景段各自在獨立 77-token CLIP 窗編碼（場景路徑原本無
+  BREAK 會截斷尾端場景標籤；現在沿用既有 `_encode_with_break`，Z-Image/Wan 端
+  BREAK 會被併成逗號無害）。
+- `_extract_prompt_line` 由「修 LLM 爛字串的主力」降級為只清場景標籤的防呆
+  （去重、丟棄洩漏的人數標籤）；移除已無用的 `_COUNT_PREFIX_RE`。
+
+**過程中發現的關鍵坑**：抽離英文外觀脈絡後，abliterated 模型（huihui-qwen3-4b）
+在場景標籤改吐中文（`从背后/性交/夜晚`），被 CJK 安全清除後塌縮成 `shot`。舊設計
+因 in-context 有英文外觀標籤而意外維持英文。解法：system prompt 明寫「SCENE 是
+中文，必須翻成英文 danbooru tags」+ 給具體英文範例錨定語言；**性愛場景在
+`is_sexual` 分支內另給一個英文性愛範例**（只給非性愛範例時，模型遇 `性交` 等顯式
+詞仍翻回中文）。範例措辭「pick the position matching THIS scene」避免體位偏置。
+
+### 角色一致性對齊
+
+職責分離後外觀改走決定性串接，連帶把一致性錨點補齊：
+
+- **外觀標籤**：DB 直連，同角色每張圖 byte-identical（舊設計經 LLM 會變）。
+- **素衣裝飾點綴**：`_assemble_prompt` 對有 `character_seed` 的角色把該 seed 傳進
+  `build_character_fragment_en(seed=...)`，與立繪/設定圖同基準（立繪
+  `routers/characters.py` 也用 character_seed）；無 seed 角色退 name 雜湊。seed 只
+  影響素衣點綴，髮/眼/臉/主服裝走 name 雜湊本就穩定。
+- **Seed / FaceID / 在場判定**不變，仍由 `resolve_present_chars` 的單一
+  `char_contexts` 共同驅動。
+
+### 驗證
+
+- 三種場景（非性愛雙女有角色 / 非性愛無角色 / 性愛無角色）各跑兩遍，輸出穩定且
+  正確：外觀段乾淨、性別正確、非性愛無幻覺、性愛輸出正確英文體位標籤；外觀段兩
+  遍 byte-identical。
+- 單元檢查：素衣點綴在立繪路徑與場景路徑一致；無 seed 角色兩次組裝相同；
+  `build_character_fragment_en`/`_strip_lead_count`/engine import 正常。
+- `ruff check services/llm/tasks.py` 11 個問題，全為 pre-existing（E701/E402/I001），
+  零新增。
+- **未跑 GPU 實機算圖**：BREAK 編碼是立繪/設定圖已在用的成熟路徑，場景路徑只是改
+  成也帶 BREAK；建議下次啟動 dev 在 app 內生一張確認視覺效果。
+
+### 已知限制（模型層，非本次能解）
+
+多角色單圖無法把「綠髮綁 A、黑髮綁 B」（SDXL/danbooru 本質限制），且 seed/FaceID
+只鎖 `char_contexts[0]` 主角；2 人以上要真正乾淨需 regional prompting 或只畫主角，
+屬產品決策。
+
+---
+
 ## 2026-06-17 — 修復 IP-Adapter 載入後其他生成路徑全部崩潰的 bug
 
 ### 問題

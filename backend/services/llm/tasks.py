@@ -95,7 +95,10 @@ async def find_alias_groups(names: list[str]) -> list[list[str]]:
 
 _ANIME_KW = {"anime", "manga", "2d", "cartoon", "lineart", "ghibli", "illustrious",
              "hassaku", "pony", "noob", "動漫", "二次元"}
-_REAL_KW  = {"photorealistic", "realistic", "zimage", "z-image", "真實"}
+# 注意：zimage/z-image 是「架構」關鍵字（決定提示詞形態：句子 vs 標籤），
+# 不是「風格」關鍵字。風格（anime/real）與架構正交——Z-Image 也有動漫與寫實兩種
+# 模型。故這裡不可把 zimage 當成 real，否則 Z-Image 動漫模型會被誤判成寫實。
+_REAL_KW  = {"photorealistic", "realistic", "真實"}
 
 
 def _detect_is_anime(style_hint: str) -> bool:
@@ -134,18 +137,23 @@ _SCENE_SYSTEM = (
     "【在場角色規則（critical）】\n"
     "• 在場 = 角色在段落中主動說話、行動、或外觀被描寫\n"
     "• 不在場 = 角色只在他人的對話或回憶中被提及\n"
+    "【is_sexual 判定（critical）】\n"
+    "• true：段落中實際正在發生性器接觸/性交等性愛行為\n"
+    "• false：僅有曖昧、緊張、危險、調情等情緒氛圍，但沒有實際性愛行為——"
+    "不可因為出現「曖昧」「危險」「翻臉」等詞就判定為 true\n"
     "【輸出】只輸出合法 JSON，禁止任何解釋或 markdown：\n"
     '{"present_chars":["在場角色名稱（使用角色本名/常用稱呼）"],'
     '"action":"正在發生的核心事件（一句話）",'
     '"location":"地點場景",'
     '"time":"時間/光線（如：白天、黃昏、夜晚、燭光室內）",'
     '"atmosphere":"整體氛圍情緒（如：緊張、溫柔、蕭殺、歡快）",'
-    '"visual_elements":["其他重要視覺元素，如武器/道具/建築特徵"]}'
+    '"visual_elements":["其他重要視覺元素，如武器/道具/建築特徵"],'
+    '"is_sexual":true或false（段落是否實際正在發生性愛行為）}'
 )
 
 _SCENE_DEFAULTS: dict = {
     "present_chars": [], "action": "", "location": "",
-    "time": "", "atmosphere": "", "visual_elements": [],
+    "time": "", "atmosphere": "", "visual_elements": [], "is_sexual": False,
 }
 
 
@@ -190,6 +198,7 @@ def _parse_scene_json(raw: str) -> dict:
         result["present_chars"] = []
     if not isinstance(result["visual_elements"], list):
         result["visual_elements"] = []
+    result["is_sexual"] = bool(result["is_sexual"]) if isinstance(result["is_sexual"], (bool, int)) else False
     return result
 
 
@@ -213,39 +222,39 @@ def _subject_count_tag(scene: dict, char_contexts: list[dict]) -> str:
     return "1girl" if n == 1 else f"{n}girls"
 
 
-def _scene_fallback_tags(scene: dict, char_contexts: list[dict]) -> str:
-    """構圖重試多次仍失敗時的最後保底。
-    只用「在場人數」這個與文體完全無關、可靠的線索（性別→1girl/1boy）。
-    刻意不從中文 location 猜室內外——那種關鍵字表換個文體（現代/科幻/西幻）就失效，
-    正是會讓不同段落又塌縮成同一張圖的根源。場景的差異化交給上游可重試的 LLM。"""
-    return f"{_subject_count_tag(scene, char_contexts)}, medium shot"
+def _scene_fallback_tags() -> str:
+    """場景標籤重試多次仍失敗時的保底——只給一個與文體無關的中性鏡頭標籤。
+    人數與外觀已由決定性片段在上游補上，這裡不需要、也刻意不從中文場景猜室內外
+    （那種關鍵字表換個文體就失效，正是塌縮成同一張圖的根源）。"""
+    return "standing, medium shot"
 
 
-def _composition_usable(tags: str, count_tag: str) -> bool:
-    """判定構圖輸出是否「有實質內容」：扣掉人數標籤後，至少還要有幾個內容標籤。
-    這是健全性下限（模型只回人數、塌縮、或沒照格式時為 False），與文體無關，
-    不是針對某篇文章調出來的魔術數字。"""
+def _composition_usable(tags: str) -> bool:
+    """判定場景標籤是否「有實質內容」：至少要有幾個標籤（模型塌縮/沒照格式時為 False）。
+    場景標籤本來就比舊的「外觀+場景」混合輸出少，故門檻取 3（動作+地點+鏡頭最低限）。"""
     if not tags:
         return False
-    count_set = {t.strip().lower() for t in count_tag.split(",")}
-    content = [t for t in tags.split(",") if t.strip() and t.strip().lower() not in count_set]
-    return len(content) >= 4
+    content = [t for t in tags.split(",") if t.strip()]
+    return len(content) >= 3
 
 
-def _extract_prompt_line(text: str, lead: str = "") -> str:
-    """從構圖輸出萃取最終標籤行：取最後一個 'PROMPT:' 之後、第一個換行之前的內容，
-    再去重（防止退化重複迴圈）並截到 28 個標籤。找不到 PROMPT: 時退回原文首行去重。
+def _extract_prompt_line(text: str) -> str:
+    """從 LLM 場景輸出萃取標籤行：取最後一個 'PROMPT:' 之後、第一個換行之前的內容，
+    清理黏接退化（底線/雜散符號）、丟棄洩漏的人數標籤、去重，截到 20 個標籤。
 
-    lead：權威人數標籤（依角色性別算出）。置於最前面，確保畫面人數以我們的判定為準，
-    不被模型偶爾重發 'PROMPT: 1boy…' 之類截斷的人數覆蓋。"""
-    if not text and not lead:
+    人數與外觀已在上游決定性組裝，這裡只處理「類型 B：場景標籤」，故任何 1girl/2girls
+    之類洩漏出來的人數標籤一律丟棄（不是它該負責的東西）。"""
+    if not text:
         return ""
     low = text.lower()
     idx = low.rfind("prompt:")
     body = text[idx + len("prompt:"):] if idx != -1 else text
     body = body.splitlines()[0] if body.splitlines() else body  # 只取一行
-    if lead:
-        body = f"{lead}, {body}"
+
+    # 模型偶爾把標籤用底線/空格黏死（frequency_penalty 罰分隔符的退化）。先在
+    # 黏住的人數標籤前後補逗號，讓後面的逐個拆分能切開。
+    body = _FUSED_COUNT_RE.sub(lambda m: f"{m.group(1)}, ", body)
+    body = _EMBEDDED_COUNT_RE.sub(lambda m: f", {m.group(1)}, ", body)
 
     seen: set[str] = set()
     out: list[str] = []
@@ -253,64 +262,141 @@ def _extract_prompt_line(text: str, lead: str = "") -> str:
         t = tag.strip()
         if not t:
             continue
-        # 去掉模型常黏在描述標籤前的多餘人數前綴（"1girl big breasts" → "big breasts"），
-        # 但保留單獨的人數標籤本身（"1girl" 不動）。
-        m = _COUNT_PREFIX_RE.match(t)
-        if m and t[m.end():].strip():
-            t = t[m.end():].strip()
+        # 底線→空格（"dark_blue_eyes" → "dark blue eyes"），與專案詞庫一致。
+        t = t.replace("_", " ").strip()
+        # 去掉標籤開頭的雜散符號（":"/"-" 等分隔符退化變體），內部連字號不受影響。
+        t = re.sub(r"^[^\w]+", "", t).strip()
+        if not t:
+            continue
+        # 洩漏的人數標籤一律丟棄（人數由 _subject_count_tag 決定性給）。
+        if _EMBEDDED_COUNT_RE.fullmatch(t):
+            continue
         key = t.lower()
         if key in seen:
             continue          # 去重：擋退化迴圈
         seen.add(key)
         out.append(t)
-        if len(out) >= 28:
+        if len(out) >= 20:
             break
     return ", ".join(out)
 
 
-_COUNT_PREFIX_RE = re.compile(
-    r'^(?:\d+\s*girls?|\d+\s*boys?|multiple\s+(?:girls|boys))\b\s*', re.IGNORECASE
-)
+def _strip_lead_count(fragment: str) -> str:
+    """去掉角色外觀片段開頭的人數/性別標籤（build_character_fragment_en 會在最前面
+    放 1girl/1boy）。多角色場景由 _subject_count_tag 統一給一個聚合人數標籤
+    （2girls 等），各片段自帶的單數 1girl 會與之衝突，故移除。"""
+    parts = [p.strip() for p in fragment.split(",") if p.strip()]
+    if parts and _EMBEDDED_COUNT_RE.fullmatch(parts[0]):
+        parts = parts[1:]
+    return ", ".join(parts)
 
 
-def _build_char_block_for_composition(char: dict, is_anime: bool) -> str:
-    """Step 2：單一角色 → 給構圖 LLM 的雙層描述（人設敘述 + 視覺 tags）。"""
-    name = (char.get("name") or "").strip()
-    description = (char.get("description") or "").strip()
+def _assemble_prompt(
+    scene: dict,
+    char_contexts: "list[dict]",
+    is_anime: bool,
+    scene_tags: str,
+    target_arch: str = "sdxl",
+) -> str:
+    """職責分離的最終組裝：決定性的「類型 A：人數＋角色外觀」＋ LLM 的「類型 B：場景」。
+
+    先依「架構」分形態，再依「風格（anime/real）」調味：
+    • target_arch == "zimage"：Qwen3 編碼器 → 自然語言「散文」。角色外觀句
+      （build_character_description_zimage，決定性）＋ LLM 場景敘述句，連成一段中文。
+    • 其餘（SDXL）：danbooru「標籤」。類型 A 外觀 + 類型 B 場景標籤，以 BREAK 分窗，
+      _encode_with_break 讓兩段各自在獨立 77-token 窗口編碼。
+    角色外觀一律走決定性片段，完全不經 LLM，故 LLM 在外觀/性別/人數上的失誤不會污染身份。"""
+    if target_arch == "zimage":
+        from services.illustration.prompt_builder import build_character_description_zimage
+        style = ("動漫插畫風格，色彩鮮明、線條乾淨" if is_anime
+                 else "寫實攝影，自然光影、電影感、細節豐富")
+        pieces = [style + "。"]
+        for c in char_contexts:
+            d = build_character_description_zimage(c)
+            if d:
+                pieces.append(d)
+        if scene_tags:
+            s = scene_tags.strip()
+            if not s.endswith(("。", "！", "？", ".", "!", "?")):
+                s += "。"
+            pieces.append(s)
+        return "".join(pieces)
 
     if is_anime:
         from services.illustration.prompt_builder import build_character_fragment_en
-        en_tags = build_character_fragment_en(char)
-        if description and en_tags:
-            return f"{name}｜人設：{description}｜視覺：{en_tags}"
-        elif description:
-            return f"{name}｜人設：{description}"
-        elif en_tags:
-            return f"{name}｜視覺：{en_tags}"
+        count_tag = _subject_count_tag(scene, char_contexts)
+        frags: list[str] = []
+        for c in char_contexts:
+            # 傳角色的 character_seed（若有），讓「素衣裝飾點綴」與立繪/設定圖用同一
+            # 基準（立繪 routers/characters.py 也是用 character_seed 生成）；沒存 seed
+            # 的角色傳 None → 退回 name 雜湊（立繪那時也是隨機，本就無穩定基準可對）。
+            # seed 只影響素衣點綴，髮/眼/臉/主服裝一律走決定性 name 雜湊，不受影響。
+            cs = c.get("character_seed")
+            frag_seed = cs if isinstance(cs, int) and cs >= 0 else None
+            frag = _strip_lead_count(build_character_fragment_en(c, seed=frag_seed))
+            if frag:
+                frags.append(frag)
+        identity = ", ".join([count_tag, *frags])
+        return f"{identity} BREAK {scene_tags}" if scene_tags else identity
     else:
         from services.illustration.prompt_builder import build_character_fragment
-        zh_tags = build_character_fragment(char)
-        if description and zh_tags:
-            return f"{name}｜人設：{description}｜外觀：{zh_tags}"
-        elif description:
-            return f"{name}｜人設：{description}"
-        elif zh_tags:
-            return f"{name}｜外觀：{zh_tags}"
+        frags = []
+        for c in char_contexts:
+            frag = build_character_fragment(c)
+            if frag:
+                nm = (c.get("name") or "").strip()
+                frags.append(f"{nm}：{frag}" if nm else frag)
+        identity = "；".join(frags)
+        if identity and scene_tags:
+            return f"{identity} BREAK {scene_tags}"
+        return scene_tags or identity
 
-    return f"{name}" if name else ""
+
+_FUSED_COUNT_RE = re.compile(
+    r'\b(\d*\s*(?:girls?|boys?))_', re.IGNORECASE
+)
+_EMBEDDED_COUNT_RE = re.compile(
+    r'\b(\d+\s*girls?|\d+\s*boys?|multiple\s+(?:girls|boys))\b', re.IGNORECASE
+)
+
+
+def _build_char_context_for_scene(char: dict) -> str:
+    """給構圖 LLM 的「輕量」角色脈絡：只給名字＋性別＋身分/關係，
+    讓它能正確描述「誰對誰做什麼動作」，但**刻意不給外觀**（髮色/瞳色/服裝/體型）。
+
+    外觀屬於「類型 A：角色固定外觀」，由 build_character_fragment_en()／
+    build_character_fragment() 決定性串接（見 expand_prompt 的組裝），完全不經過
+    LLM。這樣 LLM 抄壞外觀、抄錯性別、或塌縮，都不會污染角色身份——身份永遠以
+    決定性片段為權威來源。"""
+    name = (char.get("name") or "").strip()
+    g = (char.get("gender") or "").strip()
+    desc = (char.get("description") or "").strip()
+    # 只取人設第一句當身分/關係脈絡（足以判斷動作主從），避免把整段外觀敘述帶進去。
+    role = re.split(r"[。\n]", desc)[0].strip() if desc else ""
+    bits = [b for b in (g, role) if b]
+    return f"{name}（{'，'.join(bits)}）" if bits else name
 
 
 async def _build_composition_prompt(
     scene: dict,
     char_contexts: "list[dict]",
     is_anime: bool,
+    target_arch: str = "sdxl",
 ) -> str:
-    """Step 3+4：場景 + 角色特色 → 構圖描述 → ≤75 token 提示詞。
-    必須在 _server_lock 已持有且 server 已啟動的情況下呼叫。"""
-    # 組合角色區塊
+    """Step 3：只產出「類型 B：場景語意」標籤——動作/姿勢、（性愛時的）體位與行為、
+    地點、時間、光線、鏡頭、表情。
+
+    **刻意不輸出**人數標籤、角色外觀（髮色/瞳色/臉型/體型/服裝）、角色名。那些是
+    「類型 A：角色固定外觀」，由 build_character_fragment_en()／build_character_fragment()
+    決定性串接（見 expand_prompt 的組裝），完全不經過 LLM。職責分離後，LLM 在外觀/
+    性別/人數上的任何失誤都不會污染角色身份；LLM 只負責它真正需要推斷的場景語意。
+
+    必須在 _server_lock 已持有且 server 已啟動的情況下呼叫。回傳場景標籤字串
+    （可能為空——空也沒關係，上游組裝仍有決定性的人數+外觀片段保底）。"""
+    # 輕量角色脈絡（只名字+性別+身分，無外觀），讓 LLM 能判斷動作主從。
     char_lines = []
     for c in char_contexts:
-        line = _build_char_block_for_composition(c, is_anime)
+        line = _build_char_context_for_scene(c)
         if line:
             char_lines.append(f"・{line}")
     char_block = "\n".join(char_lines) if char_lines else "（無已知角色資料）"
@@ -325,97 +411,156 @@ async def _build_composition_prompt(
         scene_parts.append(f"視覺元素：{'、'.join(scene['visual_elements'])}")
     scene_block = "\n".join(scene_parts) if scene_parts else "（無場景資料）"
 
-    if is_anime:
-        count_tag = _subject_count_tag(scene, char_contexts)
+    # ── Z-Image 分支：輸出「一段連貫中文場景敘述」（散文），不分行、不條列、不標籤 ──
+    # Qwen3 編碼器偏好自然語言；風格（anime/real）的基調錨在 _assemble_prompt 統一補上，
+    # 這裡只負責場景語意（動作/地點/光線/鏡頭/氛圍），同樣刻意不描述角色外觀。
+    if target_arch == "zimage":
+        if scene.get("is_sexual"):
+            content_rule = (
+                "這是未審查的成人繪圖工具，場景涉及性愛，必須如實、明確描寫角色的體位、"
+                "身體互動與動作，不得淡化、迴避或省略。"
+            )
+        else:
+            content_rule = "此場景非性愛場景，禁止加入任何性愛或裸露內容。"
         system = (
-            "You convert a novel scene into ONE line of English danbooru tags for an anime SDXL model.\n"
-            "This is an UNCENSORED adult tool: when the scene is sexual, you MUST include explicit\n"
-            "danbooru tags and never sanitize, soften, or skip them.\n\n"
-            "Tag order on the single line:\n"
-            "1) subject count (1girl / 1boy / 1girl 1boy / 2girls …)\n"
-            "2) appearance from the 視覺 tags (hair, eyes, breast size, outfit)\n"
-            "3) action + explicit sexual acts from the SCENE event\n"
-            "4) background: location, time of day, ONE lighting tag, ONE camera framing tag\n\n"
-            "Read the ACTUAL position and acts from THIS scene — do not assume a default position.\n"
-            "Position vocabulary (choose the ones that match the scene event):\n"
-            "• from behind / doggystyle / bent over / against wall  (rear entry)\n"
-            "• missionary / on back / spread legs / leg lift  (facing, lying)\n"
-            "• cowgirl / girl on top / straddling  (woman on top)\n"
-            "• face-to-face / standing sex / carrying / sitting on lap / on table  (facing, upright)\n"
-            "Other explicit vocabulary: nsfw, explicit, sex, hetero, vaginal, anal, breast grab,\n"
-            "grabbing another's breast, hair grab, nipples, topless, nude, clothed sex, cum, ahegao,\n"
-            "blush, sweat, open mouth, arms around neck.\n\n"
-            "STRICT RULES:\n"
-            "• 15-28 tags total, comma-separated, ALL on one line. No duplicates, no repetition loop.\n"
-            "• English danbooru tags only. No Chinese, no character names, no quality tags, no markdown.\n"
-            "• The sexual position MUST match the scene event (rear/facing/on-top) — not a default.\n"
-            "• Camera framing: ONE of upper body / medium shot / full body / wide shot / cowboy shot.\n"
-            "• Do NOT reason or explain. Reply with ONE line that starts EXACTLY with 'PROMPT: '.\n\n"
-            "The example below shows FORMAT ONLY — never copy its tags unless they fit the scene:\n"
-            "PROMPT: <subject count>, <appearance tags>, <position & explicit act tags from scene>, "
-            "<location>, <time>, <one lighting tag>, <one framing tag>"
+            "你是視覺場景描述師。根據場景資訊，寫出「一段」連貫流暢的中文場景描述，"
+            "供 Z-Image 文生圖模型使用。\n"
+            "**只描述場景與動作，不要描述角色外觀**（髮色、瞳色、臉型、體型、服裝由系統"
+            "另行決定性補上，重述只會造成衝突）。\n"
+            "描述須涵蓋：角色正在做的動作與姿態、所在地點與環境、時間與光線、"
+            "鏡頭距離與視角、整體氛圍。\n"
+            f"{content_rule}\n"
+            "只描述視覺可見的內容，不分析心理或劇情。\n"
+            "輸出 2–4 句中文，連成「一段」，不要分行、不要條列、不要逗號標籤、"
+            "不要任何思考或解釋。"
         )
         user = (
-            f"SCENE:\n{scene_block}\n\nCHARACTERS:\n{char_block}\n\n"
-            f"Subject count is: {count_tag}\nReply with one line starting 'PROMPT: '."
+            f"場景資訊：\n{scene_block}\n\n"
+            f"在場角色（僅供判斷動作主從，不要描述其外觀）：\n{char_block}"
         )
-        # prefill 直接寫死 'PROMPT: ' + 人數標籤：強制模型從正解標籤串接續，
-        # 既不留空間給散文推理，又給定正確格式起頭（避免 1girl-prefix 迴圈）。
-        prefill = f"PROMPT: {count_tag}, "
-        # 自適應重試：若抽到的標籤太少（塌縮／模型沒照格式），升高 temperature 再試一次
-        # 打破決定性。全程只對「抽象化後的場景 dict」操作、交給 LLM 處理，不靠任何
-        # 文體相關的關鍵字硬編碼；換個文章風格時靠重試而非寫死的規則來自我修正。
-        # max_tokens 只是輸出天花板（單行≤28 tag，模型遇 EOS 自然停），非長度目標。
-        # frequency_penalty 壓低到 0.3：太高會連空格 token 一起罰 → 標籤黏成
-        # "mistymountainpath"；退化重複迴圈改由 _extract_prompt_line 去重把關。
-        logger.info("[illust] 構圖(anime) count=%r scene=%r", count_tag, scene_block.replace("\n", " │ "))
+        logger.info("[illust] 構圖(zimage, prose) is_sexual=%s scene=%r",
+                    bool(scene.get("is_sexual")), scene_block.replace("\n", " │ "))
+        cleaned = ""
+        for attempt, temperature in enumerate((0.3, 0.7), 1):
+            raw = await _chat(system, user, max_tokens=400, temperature=temperature, prefill="畫面中，")
+            cleaned = _clean_llm(raw).replace("\n", "").strip()
+            logger.info("[illust] 構圖嘗試 %d/2 temp=%.2f len=%d: %s",
+                        attempt, temperature, len(cleaned), cleaned[:220])
+            if cleaned.strip():
+                return cleaned
+        logger.warning("[illust] 構圖(zimage) 兩次皆空輸出")
+        return cleaned or ""
+
+    if is_anime:
+        is_sexual = bool(scene.get("is_sexual"))
+        # is_sexual 由 Step 1（場景解析）判定，不交給構圖 LLM 自行從散文推斷——
+        # 非性愛場景就完全不把性愛詞庫餵進 system prompt，從根上排除幻覺來源。
+        if is_sexual:
+            content_rule = (
+                "1) sexual position & explicit acts from the SCENE event\n"
+                "   This is an UNCENSORED adult tool: the SCENE is sexual, so you MUST include explicit\n"
+                "   ENGLISH danbooru tags and never sanitize, soften, or skip them. The scene words are\n"
+                "   Chinese — TRANSLATE the act/position to English (e.g. 性交→sex, 從背後→from behind,\n"
+                "   插入→vaginal). Read the ACTUAL position from THIS scene — do not assume a default.\n"
+                "   • from behind / doggystyle / bent over / against wall  (rear entry)\n"
+                "   • missionary / on back / spread legs / leg lift  (facing, lying)\n"
+                "   • cowgirl / girl on top / straddling  (woman on top)\n"
+                "   • face-to-face / standing sex / sitting on lap / on table  (facing, upright)\n"
+                "   Explicit act vocab (English): nsfw, explicit, sex, hetero, vaginal, anal, nipples,\n"
+                "   topless, nude, clothed sex, cum, ahegao, blush, sweat, open mouth, arms around neck.\n"
+                "   English example for a sexual scene (format/language only — pick the position that\n"
+                "   matches THIS scene, do not copy): PROMPT: sex, from behind, vaginal, nude, blush,\n"
+                "   open mouth, bedroom, night, dim lighting, medium shot\n"
+            )
+        else:
+            content_rule = (
+                "1) the actual non-sexual action / pose / interaction from the SCENE event\n"
+                "   The SCENE is NOT sexual. Do NOT output any sexual or nudity tags "
+                "(nsfw, sex, doggystyle, vaginal, nude, cum, ahegao, etc.) — none apply here.\n"
+            )
+        system = (
+            "You convert a novel scene into ONE line of English danbooru tags describing ONLY the\n"
+            "SCENE for an anime SDXL model. The subject count (1girl/2girls…) and every character's\n"
+            "appearance (hair, eyes, face, body, breasts, outfit) are added SEPARATELY and\n"
+            "automatically downstream — you MUST NOT output any of them.\n\n"
+            "Output ONLY scene tags, in this order:\n"
+            f"{content_rule}"
+            "2) facial expression / emotion\n"
+            "3) location / setting\n"
+            "4) time of day + ONE lighting tag\n"
+            "5) ONE camera framing tag\n\n"
+            "STRICT RULES:\n"
+            "• The SCENE is written in Chinese. You MUST TRANSLATE everything into ENGLISH danbooru\n"
+            "  tags. Output ZERO Chinese characters — English tags only.\n"
+            "• FORBIDDEN in your output: 1girl/1boy/2girls or any count, character names, and any\n"
+            "  appearance tag (hair color/length, eye color/shape, face shape, body type, breast\n"
+            "  size, clothing/outfit/its colors). Those are NOT your job.\n"
+            "• 6-16 tags, comma-separated, ALL on one line. No duplicates, no quality tags, no markdown.\n"
+            "• Camera framing: ONE of upper body / medium shot / full body / wide shot / cowboy shot.\n"
+            "• Do NOT reason or explain. Reply with ONE line that starts EXACTLY with 'PROMPT: '.\n\n"
+            "Example (shows the ENGLISH language + format only; never copy its words unless they fit):\n"
+            "PROMPT: walking, looking back, worried expression, forest path, dusk, dim lighting, wide shot"
+        )
+        user = (
+            f"SCENE:\n{scene_block}\n\n"
+            f"CHARACTERS (context only — do NOT output their names or appearance):\n{char_block}\n\n"
+            "Reply with one line starting 'PROMPT: '."
+        )
+        prefill = "PROMPT: "
+        # 自適應重試：場景標籤太少（塌縮/沒照格式）就升溫再試。max_tokens 只是天花板。
+        logger.info("[illust] 構圖(anime, scene-only) is_sexual=%s scene=%r",
+                    is_sexual, scene_block.replace("\n", " │ "))
         cleaned = ""
         for attempt, temperature in enumerate((0.5, 0.85), 1):
             raw = await _chat(
-                system, user, max_tokens=256, temperature=temperature,
+                system, user, max_tokens=200, temperature=temperature,
                 prefill=prefill, frequency_penalty=0.3, presence_penalty=0.3,
             )
             # CJK 安全清除：只在清完仍留有英文字母時才採用，避免整段被清空。
             stripped = re.sub(r'[一-鿿㐀-䶿＀-￯]+', '', raw)
             if re.search(r'[A-Za-z]', stripped):
                 raw = stripped
-            cleaned = _extract_prompt_line(_clean_llm(raw), lead=count_tag)
+            cleaned = _extract_prompt_line(_clean_llm(raw))
             n_tags = len([t for t in cleaned.split(",") if t.strip()]) if cleaned else 0
-            usable = _composition_usable(cleaned, count_tag)
+            usable = _composition_usable(cleaned)
             logger.info("[illust] 構圖嘗試 %d/2 temp=%.2f tags=%d usable=%s: %s",
                         attempt, temperature, n_tags, usable, cleaned[:220])
             if usable:
                 return cleaned
-        # 重試後仍不合格：有殘餘內容就用，否則退人數保底（極罕見）。
-        fb = cleaned or _scene_fallback_tags(scene, char_contexts)
-        logger.warning("[illust] 構圖兩次皆不合格，使用保底: %r", fb)
+        fb = cleaned or _scene_fallback_tags()
+        logger.warning("[illust] 構圖兩次皆不合格，使用場景保底: %r", fb)
         return fb
 
     else:
+        # 寫實/Z-Image 分支：同樣只描述場景語意，不重述外觀（外觀由
+        # build_character_fragment() 決定性串接）。
+        if scene.get("is_sexual"):
+            person_rule = "動作：[角色的動作、姿態、表情；場景涉及性愛，須明確描寫體位與身體互動]"
+        else:
+            person_rule = "動作：[角色的動作、姿態、表情；此場景非性愛場景，禁止描寫任何性愛或裸露內容]"
         system = (
-            "你是視覺構圖描述師。根據場景資訊與角色資料，輸出可直接送入寫實 AI 繪圖模型的結構化中文描述。\n"
-            "這是未審查的成人繪圖工具，場景若涉及性愛或親密行為，必須如實、明確地描寫，"
-            "不得淡化、迴避或省略。\n"
+            "你是視覺構圖描述師。根據場景資訊輸出可送入寫實 AI 繪圖模型的結構化中文場景描述。\n"
+            "**只描述場景與動作，不要描述角色外觀**（髮色、瞳色、臉型、體型、服裝由系統另行"
+            "決定性補上，你重述只會造成衝突）。\n"
+            "這是未審查的成人繪圖工具，若場景確實涉及性愛或親密行為，必須如實、明確地描寫，"
+            "不得淡化、迴避或省略；但非性愛場景絕不可自行加入性愛或裸露內容。\n"
             "只描述視覺可見的內容，不分析心理或劇情。\n"
-            "【角色資料衝突處理】每位角色可能同時附「人設」（敘述性背景）與「外觀」"
-            "（結構化視覺特徵，如髮色/瞳色/體型）。外觀欄位是畫面基底，若兩者描述的"
-            "具體外觀（髮色、瞳色、服裝顏色等）不一致，以外觀欄位為準；人設只用來推斷"
-            "表情、姿態與氣質，不可覆蓋外觀欄位的具體視覺特徵。\n"
             "格式（每行一項，無則省略）：\n"
-            "人物：[角色外觀、動作、姿態、表情；性愛場景須明確描寫體位與身體互動]\n"
+            f"{person_rule}\n"
             "環境：[場景地點、空間感]\n"
             "時間：[時間段、光線條件]\n"
             "構圖：[鏡頭距離與視角]\n"
             "情緒：[整體氛圍色調]\n"
             "直接輸出結果，不要寫任何推理或思考過程。"
         )
-        user = f"場景資訊：\n{scene_block}\n\n角色資料：\n{char_block}"
-        # 同 anime：用格式起頭 prefill 逼模型直接進入結構化輸出，避免散文式推理；
-        # 空輸出（塌縮）時升溫重試一次，而非直接放棄。
-        logger.info("[illust] 構圖(real) scene=%r", scene_block.replace("\n", " │ "))
+        user = (
+            f"場景資訊：\n{scene_block}\n\n"
+            f"在場角色（僅供判斷動作主從，不要描述其外觀）：\n{char_block}"
+        )
+        logger.info("[illust] 構圖(real, scene-only) scene=%r", scene_block.replace("\n", " │ "))
         cleaned = ""
         for attempt, temperature in enumerate((0.2, 0.7), 1):
-            raw = await _chat(system, user, max_tokens=400, temperature=temperature, prefill="人物：")
+            raw = await _chat(system, user, max_tokens=400, temperature=temperature, prefill="動作：")
             cleaned = _clean_llm(raw)
             logger.info("[illust] 構圖嘗試 %d/2 temp=%.2f len=%d: %s",
                         attempt, temperature, len(cleaned), cleaned[:220].replace("\n", " │ "))
@@ -498,11 +643,15 @@ async def expand_prompt(
     raw_text: str,
     character_descriptions: "list[dict] | None" = None,
     style_hint: str = "",
+    target_arch: str = "sdxl",
 ) -> tuple[str, bool, list[dict]]:
     """Step 1~4 全流程：場景分析 → 篩在場角色 → 構圖融合 → 轉提示詞。
     回傳 (prompt, is_anime, char_contexts)——char_contexts 是 resolve_present_chars
     判定的在場角色，呼叫端（generate_illustration）拿它來解析 FaceID 參考圖與 seed，
     確保「畫面描述的是誰」與「FaceID 鎖的是誰臉」永遠一致。
+
+    target_arch（sdxl/zimage）決定提示詞「形態」：zimage 走自然語言散文、
+    sdxl 走 danbooru 標籤；風格（anime/real）正交，由 is_anime 另行調味。
     """
     resolved = await resolve_present_chars(raw_text, character_descriptions, style_hint)
     scene, char_contexts, is_anime = resolved["scene"], resolved["char_contexts"], resolved["is_anime"]
@@ -520,13 +669,22 @@ async def expand_prompt(
     async with _server_lock:
         await _ensure_server(path, n_ctx)
         try:
-            # ── Step 3+4：構圖融合 + 轉提示詞 ────────────────────────────────
-            prompt = await _build_composition_prompt(scene, char_contexts, is_anime)
+            # ── Step 3：LLM 只產出「類型 B：場景語意」（zimage 散文 / sdxl 標籤）──
+            scene_tags = await _build_composition_prompt(scene, char_contexts, is_anime, target_arch)
         finally:
             _arm_idle_stop()
 
-    logger.info("[illust] 最終 prompt (%s): %s", "anime" if is_anime else "real", prompt[:300])
-    return prompt or ("1girl, medium shot, indoors" if is_anime else ""), is_anime, char_contexts
+    # ── Step 4：決定性組裝（先架構分形態、再風格調味）─────────────────────
+    prompt = _assemble_prompt(scene, char_contexts, is_anime, scene_tags, target_arch)
+    logger.info("[illust] 最終 prompt (%s/%s): %s",
+                target_arch, "anime" if is_anime else "real", prompt[:300])
+    if prompt:
+        return prompt, is_anime, char_contexts
+    if target_arch == "zimage":
+        fallback = "動漫插畫風格，一名人物站在室內，中景。" if is_anime else "寫實攝影，一名人物站在室內，中景。"
+    else:
+        fallback = "1girl, medium shot, indoors" if is_anime else ""
+    return fallback, is_anime, char_contexts
 
 
 # ─── 角色特徵提取 ─────────────────────────────────────────────────────────────

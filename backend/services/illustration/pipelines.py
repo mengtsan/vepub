@@ -23,23 +23,85 @@ _BASE_DIR = str(MODELS_DIR)
 
 _pipe                     = None
 _loaded_style: str | None = None
+_loaded_path:  str | None = None   # 目前載入的模型檔路徑（快取鍵之一）
 _pipe_lock                = asyncio.Lock()
 
 
+def _single_model_entry() -> dict | None:
+    """單一模型模式（settings.single_model_mode）開啟時，回傳目前 active 的圖像模型，
+    不分 anime/real。檔案不存在則回 None（退回正常雙模型路由）。"""
+    try:
+        if not getattr(get_settings(), "single_model_mode", False):
+            return None
+        from services.model_registry import get_registry
+        image = get_registry().get("image", {})
+        active_id = image.get("active")
+        info = image.get("models", {}).get(active_id) if active_id else None
+        if info:
+            path = info.get("local_path", "")
+            if path and os.path.isfile(path):
+                return info
+    except Exception:
+        pass
+    return None
+
+
 def _find_model_entry(style: Literal["anime", "real"]) -> dict | None:
+    forced = _single_model_entry()
+    if forced is not None:
+        return forced
     try:
         from services.model_registry import get_registry
-        for _mid, info in get_registry().get("image", {}).get("models", {}).items():
-            if info.get("style") == style and info.get("type", "diffusers") == "diffusers":
-                path = info.get("local_path", "")
-                if path and os.path.isfile(path):
-                    return info
+        image  = get_registry().get("image", {})
+        models = image.get("models", {})
+
+        def _ok(info: dict) -> bool:
+            path = info.get("local_path", "")
+            return (
+                info.get("style") == style
+                and info.get("type", "diffusers") == "diffusers"
+                and bool(path) and os.path.isfile(path)
+            )
+
+        # 優先採用 registry 標記為 active 的模型（僅當其風格與請求相符），
+        # 讓「同風格下 activate 切換不同模型檔」真正生效；搭配 ensure_pipe 的
+        # _loaded_path 快取鍵，下次生成會自動卸載舊模型並換載新的。
+        active_id = image.get("active")
+        if active_id:
+            info = models.get(active_id)
+            if info and _ok(info):
+                return info
+
+        # active 不存在或風格不符 → 回退到第一個符合該風格的模型。
+        for _mid, info in models.items():
+            if _ok(info):
+                return info
     except Exception:
         pass
     return None
 
 
 # ─── 架構偵測 ─────────────────────────────────────────────────────────────────
+
+def inspect_arch(model_path: str) -> str | None:
+    """UI 用的架構偵測：檔案不存在或讀不到時回 None（而非像 _detect_architecture
+    那樣預設回 'sdxl'，避免把遺失/未知的模型誤標成 SDXL）。"""
+    if not model_path or not os.path.isfile(model_path):
+        return None
+    try:
+        from safetensors import safe_open
+        with safe_open(model_path, framework="pt", device="cpu") as f:
+            keys = " ".join(list(f.keys())[:12])
+        if "cap_embedder" in keys or "context_refiner" in keys or "cap_pad_token" in keys:
+            return "zimage"
+        if "adaln_modulation_cross_attn" in keys or (
+            "model.diffusion_model.blocks" in keys and "cross_attn" in keys
+        ):
+            return "wan"
+        return "sdxl"
+    except Exception:
+        return None
+
 
 def _detect_architecture(model_path: str) -> str:
     try:
@@ -59,6 +121,16 @@ def _detect_architecture(model_path: str) -> str:
 
 def _active_model_arch(style: str) -> str:
     from diffusers import WanPipeline
+    forced = _single_model_entry()
+    # 單一模型模式：架構一律取 active 模型的（不分 style）。若該模型已載入就讀其旗標。
+    if forced is not None:
+        if _pipe is not None and _loaded_path == forced.get("local_path"):
+            if getattr(_pipe, "_is_zimage", False):
+                return "zimage"
+            if isinstance(_pipe, WanPipeline):
+                return "wan"
+            return "sdxl"
+        return _detect_architecture(forced["local_path"])
     if _pipe is not None and _loaded_style == style:
         if getattr(_pipe, "_is_zimage", False):
             return "zimage"
@@ -79,7 +151,15 @@ def _load_sdxl_pipe_sync(entry: dict, model_path: str):
 
     kwargs: dict = {"torch_dtype": torch.float16, "use_safetensors": True}
 
+    # VAE 優先序：使用者在 UI 選的全域 VAE（models/vae/）> 模型自帶 vae_path > 內建。
     vae_path = entry.get("vae_path", "")
+    _sel_vae = getattr(get_settings(), "active_vae", "")
+    if _sel_vae:
+        _cand = os.path.join(_BASE_DIR, "vae", _sel_vae)
+        if os.path.isfile(_cand):
+            vae_path = _cand
+        else:
+            logger.warning("選用的 VAE 不存在，改用內建: %s", _sel_vae)
     if vae_path and os.path.isfile(vae_path):
         from diffusers import AutoencoderKL
         logger.info("載入 VAE: %s", os.path.basename(vae_path))
@@ -100,16 +180,27 @@ def _load_sdxl_pipe_sync(entry: dict, model_path: str):
 
     _pred_type = getattr(pipe.scheduler.config, "prediction_type", "epsilon")
     pipe._is_vpred = (_pred_type == "v_prediction")
+    pipe._is_turbo = "turbo" in entry.get("name", "").lower()  # SDXL Turbo → 8步+CFG1.5
     pipe.vae.enable_slicing()
 
     print(f"[illustration] SDXL 模型就緒  prediction_type={_pred_type}  sampler=DPM++2M-Karras")
 
-    # ── Textual Inversion embeddings（lazypos / lazyneg / lazyhand）──
-    # 在 IP-Adapter 前載入，避免 tokenizer 詞表 ID 衝突
+    # ── Textual Inversion embeddings ──
+    # 在 IP-Adapter 前載入，避免 tokenizer 詞表 ID 衝突。
+    # 以掃描 models/embeddings/ 目錄為準；active_embeddings 非空時只載入清單內的，
+    # 空（預設）則載入目錄內全部（保留原本 lazypos/lazyneg/lazyhand 行為）。
     _emb_dir = os.path.join(_BASE_DIR, "embeddings")
+    _enabled = set(getattr(get_settings(), "active_embeddings", []) or [])
+    _emb_files = (
+        sorted(f for f in os.listdir(_emb_dir) if f.endswith(".safetensors"))
+        if os.path.isdir(_emb_dir) else []
+    )
     _emb_tokens: list[str] = []
-    for _token in ("lazypos", "lazyneg", "lazyhand"):
-        _emb_path = os.path.join(_emb_dir, f"{_token}.safetensors")
+    for _fname in _emb_files:
+        _token = os.path.splitext(_fname)[0]
+        if _enabled and _fname not in _enabled and _token not in _enabled:
+            continue
+        _emb_path = os.path.join(_emb_dir, _fname)
         if not os.path.isfile(_emb_path):
             continue
         try:
@@ -281,6 +372,7 @@ def _load_zimage_pipe_sync(entry: dict, model_path: str):
     pipe.to("cuda")
     pipe.vae.enable_slicing()
     pipe._is_zimage = True
+    pipe._is_turbo  = is_turbo   # 供 _resolve_effective_params 判定 8步+CFG1.0（官方 Turbo 建議）
     pipe._is_vpred  = False
     pipe._ip_adapter_loaded = False
     pipe._ip_adapter_mode   = "none"
@@ -330,15 +422,27 @@ def _load_wan_pipe_sync(entry: dict, model_path: str):
 # ─── 非同步 pipe 管理 ─────────────────────────────────────────────────────────
 
 async def ensure_pipe(style: Literal["anime", "real"] = "anime"):
-    global _pipe, _loaded_style
+    global _pipe, _loaded_style, _loaded_path
     async with _pipe_lock:
-        if _pipe is not None and _loaded_style == style:
-            return _pipe
         loop = asyncio.get_event_loop()
         entry = _find_model_entry(style)
         if not entry:
             raise RuntimeError(f"找不到 {style} 風格的本地模型，請先在 ModelManager 下載")
         model_path = entry["local_path"]
+
+        # 快取鍵＝風格＋模型檔路徑：同風格但換了不同模型檔也要重載，
+        # 否則會回傳舊的 cached pipe（切了不生效）。
+        # 單一模型模式下不分 anime/real，只看路徑，避免每換場景就重載同一顆模型。
+        _single = _single_model_entry() is not None
+        if _pipe is not None and _loaded_path == model_path and (_single or _loaded_style == style):
+            return _pipe
+
+        # 需要換模型：務必先卸載舊 pipe 並歸還 VRAM，再載入新模型。
+        # 否則新舊模型會同時佔 VRAM（ZImage 21GB 直接接近 25.7GB 上限→OOM），
+        # 且舊模型的 CUDA 快取不會還給配置器（nvidia-smi 看起來像沒釋放）。
+        if _pipe is not None:
+            _unload_pipe_sync()
+
         arch = _detect_architecture(model_path)
         if arch == "zimage":
             _pipe = await loop.run_in_executor(None, _load_zimage_pipe_sync, entry, model_path)
@@ -347,21 +451,16 @@ async def ensure_pipe(style: Literal["anime", "real"] = "anime"):
         else:
             _pipe = await loop.run_in_executor(None, _load_sdxl_pipe_sync, entry, model_path)
         _loaded_style = style
+        _loaded_path = model_path
         return _pipe
 
 
 async def unload_pipe():
-    global _pipe, _loaded_style
+    global _pipe, _loaded_style, _loaded_path
     async with _pipe_lock:
         if _pipe is None:
             return
-        import torch
-        import gc
-        _pipe = None
-        _loaded_style = None
-        gc.collect()
-        torch.cuda.empty_cache()
-        logger.info("模型已卸載，VRAM 已釋放")
+        _unload_pipe_sync()
 
 
 # ─── 缺漏的公開符號（illustration_engine.py / generation.py 直接 import）────
@@ -381,14 +480,18 @@ def _load_pipe_sync(entry: dict, model_path: str, arch: str):
 
 
 def _unload_pipe_sync():
-    global _pipe, _loaded_style
+    global _pipe, _loaded_style, _loaded_path
     import torch
     import gc
+    # 丟掉所有 Python 引用後 empty_cache，CUDA 配置器才會把顯存歸還；
+    # 只設 None 而不 gc/empty_cache 的話，nvidia-smi 看起來會像沒釋放。
     _pipe = None
     _loaded_style = None
+    _loaded_path = None
     gc.collect()
-    torch.cuda.empty_cache()
-    logger.info("模型已卸載（sync）")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logger.info("模型已卸載，VRAM 已釋放（sync）")
 
 
 async def _get_pipe(style: Literal["anime", "real"] = "anime"):
@@ -398,9 +501,21 @@ async def _get_pipe(style: Literal["anime", "real"] = "anime"):
 def _resolve_effective_params(pipe, s):
     is_turbo  = getattr(pipe, "_is_turbo", False)
     is_zimage = getattr(pipe, "_is_zimage", False)
-    if is_turbo or is_zimage:
-        return 8, 1.5
-    return s.steps, s.guidance_scale
+    # Z-Image：官方 Turbo 建議停用 CFG（guidance_scale≤1 → diffusers 不跑雙批 CFG），
+    # 8 步即可；非 Turbo 的 Z-Image 基礎模型才需 CFG 3–5 與 28 步。
+    if is_zimage:
+        auto_steps, auto_cfg = (8, 1.0) if is_turbo else (28, 4.0)
+    elif is_turbo:
+        auto_steps, auto_cfg = 8, 1.5
+    else:
+        # 標準 SDXL（非 Turbo）：步數與 CFG 一律由設定決定。
+        return s.steps, s.guidance_scale
+    # Turbo / Z-Image：預設沿用官方自動值；使用者在「模型管理」開啟 turbo_override 後，
+    # 步數與 CFG 皆改用設定值。注意 Z-Image Turbo CFG>1 會觸發 diffusers 的 dual-batch
+    # CFG（畫面易退化），這是使用者明確選擇手動控制後的自負風險。
+    if getattr(s, "turbo_override", False):
+        return s.steps, s.guidance_scale
+    return auto_steps, auto_cfg
 
 
 # ─── BREAK 編碼（diffusers 不原生支援 A1111 的 BREAK 關鍵字）─────────────────

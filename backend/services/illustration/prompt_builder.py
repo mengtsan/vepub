@@ -48,6 +48,81 @@ def build_character_fragment(char: dict) -> str:
     return char.get("description") or ""
 
 
+# ─── Z-Image 自然語言角色描述 ─────────────────────────────────────────────────
+# Z-Image 用 Qwen3 文字編碼器，偏好連貫的自然語言句子，而非 SDXL/CLIP 的逗號
+# danbooru 標籤。這裡把與 build_character_fragment 相同的決定性外觀欄位組成一句
+# 流暢中文描述（同角色每次一致，完全不經 LLM），是「架構分形態」中 zimage 的角色片段。
+
+_AGE_PROSE_ZH: dict[str, str] = {
+    "幼兒":      "年幼的",
+    "少女/少年": "年輕的",
+    "青年":      "年輕的",
+    "壯年":      "成熟的",
+    "中年":      "中年的",
+    "老年":      "年長的",
+}
+
+
+def build_character_description_zimage(char: dict) -> str:
+    """把角色固定外觀組成「一句」連貫中文描述，供 Z-Image（Qwen3 編碼器）使用。
+    與 build_character_fragment 取用相同欄位，但輸出散文而非逗號標籤。"""
+    g = char.get("gender") or ""
+    noun = {"女": "女子", "男": "男子"}.get(g, "人物")
+    age  = _AGE_PROSE_ZH.get(char.get("age_hint") or "", "")
+    subject = f"一名{age}{noun}"
+
+    looks: list[str] = []
+
+    hair = (char.get("hair_color") or "") + (char.get("hair_style") or "")
+    if hair:
+        looks.append(hair)
+
+    eye_color = char.get("eye_color") or ""
+    eye_shape = char.get("eye_shape") or ""
+    if eye_color and eye_shape:
+        looks.append(f"{eye_color}的{eye_shape}")
+    elif eye_color:
+        looks.append(f"{eye_color}的眼眸")
+    elif eye_shape:
+        looks.append(eye_shape)
+
+    if char.get("face_shape"):
+        looks.append(char["face_shape"])
+    if char.get("skin_tone"):
+        looks.append(f"{char['skin_tone']}的肌膚")
+    if char.get("body_type"):
+        looks.append(f"{char['body_type']}的身形")
+    if g == "女":
+        if char.get("bwh"):
+            looks.append(f"三圍{char['bwh']}")
+        if char.get("cup_size"):
+            looks.append(f"{char['cup_size']}罩杯")
+
+    desc = subject
+    if looks:
+        desc += "，" + "、".join(looks)
+
+    # 服裝（era_style 提供時代脈絡，signature_outfit 提供具體款式）
+    era    = char.get("era_style") or ""
+    outfit = char.get("signature_outfit") or ""
+    attire = "，".join(p for p in (era, outfit) if p)
+    if attire:
+        desc += f"，身著{attire}"
+
+    if char.get("color_palette"):
+        desc += f"，整體色調以{char['color_palette']}為主"
+
+    acc = (char.get("accessories") or "").strip()
+    if acc and acc not in ("無", "無特色"):
+        desc += f"，配有{acc}"
+
+    marks = (char.get("distinctive_marks") or "").strip()
+    if marks:
+        desc += f"，{marks}"
+
+    return desc + "。"
+
+
 # ─── 英文 danbooru tags 常數 ──────────────────────────────────────────────────
 
 _GENDER_EN = {"女": "1girl", "男": "1boy"}
@@ -535,9 +610,12 @@ async def _expand_prompt(
     raw_text: str,
     character_descriptions: "list[dict] | None" = None,
     style_hint: str = "",
+    target_arch: str = "sdxl",
 ) -> tuple[str, bool]:
     from services import llm_engine
-    return await llm_engine.expand_prompt(raw_text, character_descriptions, style_hint)
+    return await llm_engine.expand_prompt(
+        raw_text, character_descriptions, style_hint, target_arch=target_arch
+    )
 
 
 def _infer_is_anime(text: str) -> bool:

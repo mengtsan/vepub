@@ -4,29 +4,13 @@
     "models": {}
   },
   "image": {
-    "active": "kodoranimem_v27.safetensors",
+    "active": "luciddreamerz_v0777azit.safetensors",
     "models": {
-      "moodypromix_zitv12dpofp8.safetensors": {
-        "name": "moodyProMix zitV12 (Z-Image Turbo)",
-        "type": "diffusers",
-        "local_path": "C:\\Users\\holy_\\Downloads\\vepub\\backend\\models\\image\\zImageTurbo_turbo.safetensors",
-        "size_bytes": 12309866400,
-        "source": "https://civitai.red/api/download/models/2966827",
-        "style": "real"
-      },
       "jankutrainedchenkinnoobai_v777.safetensors": {
         "name": "JANKUTrainedChenkinNoobai_v777.safetensors",
         "type": "diffusers",
         "local_path": "C:\\Users\\holy_\\Downloads\\vepub\\backend\\models\\image\\JANKUTrainedChenkinNoobai_v777.safetensors",
         "size_bytes": 6938040674,
-        "source": "https://civitai.red/api/download/models/2786084",
-        "style": "anime"
-      },
-      "kodoranimem_v27.safetensors": {
-        "name": "kodoranimem_v27.safetensors",
-        "type": "diffusers",
-        "local_path": "C:\\Users\\holy_\\Downloads\\vepub\\backend\\models\\image\\kodoranimem_v27.safetensors",
-        "size_bytes": 7140417986,
         "source": "",
         "style": "anime"
       },
@@ -35,20 +19,46 @@
         "type": "diffusers",
         "local_path": "C:\\Users\\holy_\\Downloads\\vepub\\backend\\models\\image\\kodoranime_v101.safetensors",
         "size_bytes": 6938041924,
-        "source": ""
+        "source": "",
+        "style": "anime"
       },
-      "zimageturbo_turbo.safetensors": {
-        "name": "zImageTurbo_turbo.safetensors",
+      "luciddreamerz_v0777azit.safetensors": {
+        "name": "luciddreamerZ_v0777AZit.safetensors",
         "type": "diffusers",
-        "local_path": "C:\\Users\\holy_\\Downloads\\vepub\\backend\\models\\image\\zImageTurbo_turbo.safetensors",
-        "size_bytes": 12309866400,
-        "source": ""
+        "local_path": "C:\\Users\\holy_\\Downloads\\vepub\\backend\\models\\image\\luciddreamerZ_v0777AZit.safetensors",
+        "size_bytes": 6155008632,
+        "source": "",
+        "style": "anime"
+      },
+      "zimageturbonsfw_90bf16fp8.safetensors": {
+        "name": "zImageTurboNSFW_90BF16FP8.safetensors",
+        "type": "diffusers",
+        "local_path": "C:\\Users\\holy_\\Downloads\\vepub\\backend\\models\\image\\zImageTurboNSFW_90BF16FP8.safetensors",
+        "size_bytes": 6155014840,
+        "source": "",
+        "style": "real"
+      },
+      "miaomiaoharem_v20.safetensors": {
+        "name": "miaomiaoHarem_v20.safetensors",
+        "type": "diffusers",
+        "local_path": "C:\\Users\\holy_\\Downloads\\vepub\\backend\\models\\image\\miaomiaoHarem_v20.safetensors",
+        "size_bytes": 6938040400,
+        "source": "",
+        "style": "anime"
+      },
+      "moodypromix_zitv13.safetensors": {
+        "name": "moodyProMix_zitV13.safetensors",
+        "type": "diffusers",
+        "local_path": "C:\\Users\\holy_\\Downloads\\vepub\\backend\\models\\image\\moodyProMix_zitV13.safetensors",
+        "size_bytes": 12309876384,
+        "source": "",
+        "style": "real"
       }
     }
   },
   "llm": {
-    "chat": "huihui-qwen3-4b-abliterated-v2-q8_0",
-    "analysis": "gemma-4-12b-it-aeon-abliterated-k4",
+    "chat": "huihui-gemma-4-12b-it-abliterated.q4_k_m",
+    "analysis": "huihui-gemma-4-12b-it-abliterated.q4_k_m",
     "models": {
       "huihui-qwen3-4b-abliterated-v2-q8_0": {
         "name": "Qwen3 4B (Abliterated, Q8)",
@@ -56,14 +66,6 @@
         "local_path": "C:\\Users\\holy_\\Downloads\\vepub\\backend\\models\\llm\\huihui-qwen3-4b-abliterated-v2-q8_0.gguf",
         "size_bytes": 4280401216,
         "source": ""
-      },
-      "gemma-4-12b-it-aeon-abliterated-k4": {
-        "name": "Gemma 4 12B AEON Abliterated (K4)",
-        "type": "gguf",
-        "local_path": "C:\\Users\\holy_\\Downloads\\vepub\\backend\\models\\llm\\Gemma-4-12B-it-AEON-Abliterated-K4.gguf",
-        "size_bytes": 0,
-        "ctx_size": 50000,
-        "source": "https://huggingface.co/mradermacher/Gemma-4-12B-it-AEON-Abliterated-K4-GGUF"
       },
       "huihui-gemma-4-12b-it-abliterated.q4_k_m": {
         "name": "Huihui-gemma-4-12B-it-abliterated.Q4_K_M.gguf",

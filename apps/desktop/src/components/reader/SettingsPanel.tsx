@@ -1,12 +1,11 @@
 import React, { useState, useEffect, useRef } from "react";
-import { toast } from "sonner";
 import { useReaderStore } from "@/stores/reader";
 import { usePlayerStore } from "@/stores/player";
-import { getIllustrationSettings, patchIllustrationSettings, saveSettings, listLoras, LoraInfo } from "@/lib/api";
+import { getAllModels } from "@/lib/model-api";
 import {
   X, Sliders, Type, Volume2, HardDrive,
   Mic, Wand2, Bot, ChevronDown, ChevronUp,
-  Loader2, CheckCircle2, UploadCloud, ImagePlus
+  CheckCircle2, UploadCloud, ImagePlus
 } from "lucide-react";
 import { TTSMode } from "@/stores/player";
 
@@ -15,16 +14,18 @@ interface SettingsPanelProps {
   onClose: () => void;
 }
 
-// 預設繪圖風格前綴：label 顯示於 UI，value 為實際附加到 prompt 最前面的英文修飾詞
-const STYLE_PRESETS: { label: string; value: string }[] = [
-  { label: "動漫",     value: "anime style, vibrant colors, clean lineart, highly detailed" },
-  { label: "插畫厚塗", value: "digital painting, painterly, soft cinematic lighting, concept art" },
-  { label: "水彩",     value: "watercolor painting, soft washes, delicate, artistic" },
-  { label: "吉卜力",   value: "studio ghibli style, soft colors, hand-drawn, whimsical, dreamy" },
-  { label: "油畫",     value: "oil painting, thick brush strokes, classical, rich texture" },
-  { label: "寫實",     value: "photorealistic, cinematic lighting, ultra-detailed, realistic" },
-  { label: "賽博龐克", value: "cyberpunk, neon lights, futuristic, high contrast, atmospheric" },
-  { label: "素描",     value: "pencil sketch, monochrome, detailed linework, hand-drawn" },
+// 預設繪圖風格前綴：label 顯示於 UI，value 為實際附加到 prompt 最前面的英文修飾詞。
+// style 對應 ModelManager 的「生圖風格（anime/real）」——分組顯示，並在缺對應風格模型時停用該組。
+type PresetStyle = "anime" | "real";
+const STYLE_PRESETS: { label: string; value: string; style: PresetStyle }[] = [
+  { label: "動漫",     value: "anime style, vibrant colors, clean lineart, highly detailed",        style: "anime" },
+  { label: "吉卜力",   value: "studio ghibli style, soft colors, hand-drawn, whimsical, dreamy",     style: "anime" },
+  { label: "水彩",     value: "watercolor painting, soft washes, delicate, artistic",               style: "anime" },
+  { label: "素描",     value: "pencil sketch, monochrome, detailed linework, hand-drawn",           style: "anime" },
+  { label: "寫實",     value: "photorealistic, cinematic lighting, ultra-detailed, realistic",      style: "real"  },
+  { label: "插畫厚塗", value: "digital painting, painterly, soft cinematic lighting, concept art",   style: "real"  },
+  { label: "油畫",     value: "oil painting, thick brush strokes, classical, rich texture",         style: "real"  },
+  { label: "賽博龐克", value: "cyberpunk, neon lights, futuristic, high contrast, atmospheric",      style: "real"  },
 ];
 
 export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
@@ -33,20 +34,14 @@ export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
     fontSize,
     fontFamily,
     lineHeight,
-    volume,
     hardwareInfo,
     setTheme,
     setFontSize,
     setFontFamily,
     setLineHeight,
-    setVolume,
     illustrationPromptPrefix,
-    illustrationWidth,
-    illustrationHeight,
     illustrationSeed,
     setIllustrationPromptPrefix,
-    setIllustrationWidth,
-    setIllustrationHeight,
     setIllustrationSeed,
   } = useReaderStore();
 
@@ -69,87 +64,18 @@ export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
 
   const [showAdvanced, setShowAdvanced] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [negativePrompt, setNegativePrompt] = useState("");
-  const negSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // 生圖參數（與後端同步）
-  const [illSteps,         setIllSteps]         = useState(30);
-  const [illCfg,           setIllCfg]           = useState(6.0);
-  const [hiresEnabled,     setHiresEnabled]     = useState(false);
-  const [hiresDenoise,     setHiresDenoise]     = useState(0.35);
-  const [adetailerEnabled, setAdetailerEnabled] = useState(true);
-  const [adetailerDenoise, setAdetailerDenoise] = useState(0.4);
-  const illSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // LoRA 管理
-  const [availableLoras, setAvailableLoras] = useState<LoraInfo[]>([]);
-  const [activeLoras, setActiveLoras] = useState<{ filename: string; weight: number; enabled: boolean }[]>([]);
-
-  // 開啟面板時載入所有插圖設定
+  // 已設定生圖風格的集合（與 ModelManager 的 anime/real 打通）：
+  // 缺對應風格模型時，該組畫風前綴停用，避免選了卻找不到模型。
+  const [availStyles, setAvailStyles] = useState<Set<PresetStyle>>(new Set(["anime", "real"]));
   useEffect(() => {
     if (!isOpen) return;
-    getIllustrationSettings().then(s => {
-      setNegativePrompt(s.negative_prompt);
-      setIllSteps(s.steps ?? 30);
-      setIllCfg(s.guidance_scale ?? 6.0);
-      setHiresEnabled(s.hires_fix_enabled ?? false);
-      setHiresDenoise(s.hires_denoise ?? 0.35);
-      setAdetailerEnabled(s.adetailer_enabled ?? true);
-      setAdetailerDenoise(s.adetailer_denoise ?? 0.4);
-      setActiveLoras(s.active_loras ?? []);
-    }).catch(() => {});
-    listLoras().then(setAvailableLoras).catch(() => {});
+    getAllModels()
+      .then(m => setAvailStyles(new Set(
+        m.image.models.map(x => x.style).filter((s): s is PresetStyle => s === "anime" || s === "real")
+      )))
+      .catch(() => {});
   }, [isOpen]);
-
-  const updateLoras = (updated: typeof activeLoras) => {
-    setActiveLoras(updated);
-    patchIllustrationSettings({ active_loras: updated }).catch(() => toast.error("儲存 LoRA 設定失敗"));
-  };
-
-  const toggleLora = (filename: string) => {
-    const existing = activeLoras.find(l => l.filename === filename);
-    let updated: typeof activeLoras;
-    if (existing) {
-      updated = activeLoras.map(l =>
-        l.filename === filename ? { ...l, enabled: !l.enabled } : l
-      );
-    } else {
-      updated = [...activeLoras, { filename, weight: 1.0, enabled: true }];
-    }
-    updateLoras(updated);
-  };
-
-  const setLoraWeight = (filename: string, weight: number) => {
-    const exists = activeLoras.some(l => l.filename === filename);
-    const updated = exists
-      ? activeLoras.map(l => l.filename === filename ? { ...l, weight } : l)
-      : [...activeLoras, { filename, weight, enabled: true }];
-    updateLoras(updated);
-  };
-
-  const getLoraState = (filename: string) =>
-    activeLoras.find(l => l.filename === filename) ?? { enabled: false, weight: 1.0 };
-
-  const patchIll = (patch: Parameters<typeof patchIllustrationSettings>[0]) => {
-    if (illSaveTimerRef.current) clearTimeout(illSaveTimerRef.current);
-    illSaveTimerRef.current = setTimeout(() => {
-      patchIllustrationSettings(patch).catch(() => toast.error("儲存生圖設定失敗"));
-    }, 600);
-  };
-
-  const handleNegativePromptChange = (v: string) => {
-    setNegativePrompt(v);
-    if (negSaveTimerRef.current) clearTimeout(negSaveTimerRef.current);
-    negSaveTimerRef.current = setTimeout(async () => {
-      if (!v.trim()) return;
-      try {
-        await patchIllustrationSettings({ negative_prompt: v });
-        await saveSettings({ illustration_negative_prompt: v });
-      } catch {
-        toast.error("儲存反向提示詞失敗");
-      }
-    }, 800);
-  };
 
 
   // 處理參考音訊檔案選擇
@@ -551,27 +477,41 @@ export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
             <div className="flex flex-col gap-1.5 pt-1">
               <span className="text-[11px] font-semibold" style={{ color: "var(--text-secondary)" }}>繪圖提示詞前綴（風格修飾）</span>
 
-              {/* 預設風格快選 */}
-              <div className="flex flex-wrap gap-1.5">
-                {STYLE_PRESETS.map((p) => {
-                  const active = illustrationPromptPrefix.trim() === p.value;
-                  return (
-                    <button
-                      key={p.label}
-                      onClick={() => setIllustrationPromptPrefix(active ? "" : p.value)}
-                      title={p.value}
-                      className={`px-2 py-1 rounded-full text-[10px] border transition-all ${
-                        active
-                          ? "border-amber-500 text-amber-500 font-bold bg-amber-500/10"
-                          : "border-transparent hover:bg-white/5"
-                      }`}
-                      style={{ backgroundColor: active ? undefined : "var(--bg-hover)", color: active ? undefined : "var(--text-secondary)" }}
-                    >
-                      {p.label}
-                    </button>
-                  );
-                })}
-              </div>
+              {/* 預設風格快選——依 ModelManager 的風格（anime/real）分組，缺模型則停用整組 */}
+              {(["anime", "real"] as PresetStyle[]).map((grp) => {
+                const has = availStyles.has(grp);
+                return (
+                  <div key={grp} className="flex flex-col gap-1">
+                    <div className="flex items-center gap-1.5 text-[9px]" style={{ color: "var(--text-secondary)" }}>
+                      <span className={grp === "anime" ? "text-violet-400" : "text-amber-400"}>
+                        {grp === "anime" ? "動畫風格" : "寫實風格"}
+                      </span>
+                      {!has && <span className="opacity-70">· 未設定{grp === "anime" ? "動畫" : "寫實"}模型，前往模型管理設定</span>}
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {STYLE_PRESETS.filter(p => p.style === grp).map((p) => {
+                        const active = illustrationPromptPrefix.trim() === p.value;
+                        return (
+                          <button
+                            key={p.label}
+                            disabled={!has}
+                            onClick={() => setIllustrationPromptPrefix(active ? "" : p.value)}
+                            title={has ? p.value : "尚未設定此風格的生圖模型"}
+                            className={`px-2 py-1 rounded-full text-[10px] border transition-all disabled:opacity-35 disabled:cursor-not-allowed ${
+                              active
+                                ? "border-amber-500 text-amber-500 font-bold bg-amber-500/10"
+                                : "border-transparent hover:bg-white/5"
+                            }`}
+                            style={{ backgroundColor: active ? undefined : "var(--bg-hover)", color: active ? undefined : "var(--text-secondary)" }}
+                          >
+                            {p.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
 
               <textarea
                 value={illustrationPromptPrefix}
@@ -584,27 +524,6 @@ export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
               <span className="text-[9px] leading-relaxed" style={{ color: "var(--text-secondary)" }}>
                 每次生圖時附加在 LLM 生成的 prompt 前，可指定畫風、藝術風格等
               </span>
-            </div>
-
-            {/* 圖片尺寸 */}
-            <div className="flex flex-col gap-1.5">
-              <span className="text-[11px] font-semibold" style={{ color: "var(--text-secondary)" }}>圖片尺寸</span>
-              <div className="flex gap-2">
-                {([512, 768, 1024] as const).map((size) => (
-                  <button
-                    key={size}
-                    onClick={() => { setIllustrationWidth(size); setIllustrationHeight(size); }}
-                    className={`flex-1 py-1.5 rounded text-[10px] border transition-all ${
-                      illustrationWidth === size && illustrationHeight === size
-                        ? "border-amber-500 text-amber-500 font-bold bg-amber-500/5"
-                        : "border-transparent hover:bg-white/5"
-                    }`}
-                    style={{ backgroundColor: (illustrationWidth !== size || illustrationHeight !== size) ? "var(--bg-hover)" : undefined }}
-                  >
-                    {size}px
-                  </button>
-                ))}
-              </div>
             </div>
 
             {/* 固定 Seed */}
@@ -640,165 +559,10 @@ export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
                 填入固定數字可重現同一張圖，-1 表示每次隨機
               </span>
             </div>
-            {/* 生圖核心參數 */}
-            <div className="flex flex-col gap-3 pt-1 px-2.5 py-2.5 rounded border" style={{ borderColor: "var(--border)", backgroundColor: "var(--bg-hover)" }}>
-              <span className="text-[11px] font-semibold" style={{ color: "var(--text-primary)" }}>擴散參數</span>
-
-              {/* Steps */}
-              <div className="flex flex-col gap-1">
-                <div className="flex justify-between text-[10px]" style={{ color: "var(--text-secondary)" }}>
-                  <span>採樣步數</span>
-                  <span className="font-mono font-bold text-amber-400">{illSteps}</span>
-                </div>
-                <input type="range" min="20" max="40" step="1" value={illSteps}
-                  onChange={e => { const v = +e.target.value; setIllSteps(v); patchIll({ steps: v }); }}
-                  className="w-full h-1 rounded accent-amber-500 cursor-pointer" />
-                <div className="flex justify-between text-[9px]" style={{ color: "var(--text-secondary)" }}>
-                  <span>20（快速）</span><span>30（建議）</span><span>40（精細）</span>
-                </div>
-              </div>
-
-              {/* CFG */}
-              <div className="flex flex-col gap-1">
-                <div className="flex justify-between text-[10px]" style={{ color: "var(--text-secondary)" }}>
-                  <span>CFG Scale（提示詞相關性）</span>
-                  <span className="font-mono font-bold text-amber-400">{illCfg.toFixed(1)}</span>
-                </div>
-                <input type="range" min="4.0" max="8.0" step="0.5" value={illCfg}
-                  onChange={e => { const v = +e.target.value; setIllCfg(v); patchIll({ guidance_scale: v }); }}
-                  className="w-full h-1 rounded accent-amber-500 cursor-pointer" />
-                <div className="flex justify-between text-[9px]" style={{ color: "var(--text-secondary)" }}>
-                  <span>4.0（柔和）</span><span>6.0（建議）</span><span>8.0（強烈）</span>
-                </div>
-              </div>
-
-              {/* Hires Fix */}
-              <div className="flex flex-col gap-1.5">
-                <div className="flex items-center justify-between">
-                  <div className="flex flex-col">
-                    <span className="text-[10px] font-semibold" style={{ color: "var(--text-primary)" }}>Hires Fix 高解析度精修</span>
-                    <span className="text-[9px]" style={{ color: "var(--text-secondary)" }}>
-                      生圖後上採樣 {Math.round(1024 * 1.5)}px × img2img 補細節（臉、手）
-                    </span>
-                  </div>
-                  <button
-                    onClick={() => { setHiresEnabled(v => { patchIll({ hires_fix_enabled: !v }); return !v; }); }}
-                    className={`relative w-9 h-5 rounded-full transition-colors ${hiresEnabled ? "bg-amber-500" : "bg-white/20"}`}
-                  >
-                    <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${hiresEnabled ? "translate-x-4" : ""}`} />
-                  </button>
-                </div>
-
-                {hiresEnabled && (
-                  <div className="flex flex-col gap-1">
-                    <div className="flex justify-between text-[10px]" style={{ color: "var(--text-secondary)" }}>
-                      <span>重繪強度（Denoise）</span>
-                      <span className="font-mono font-bold text-amber-400">{hiresDenoise.toFixed(2)}</span>
-                    </div>
-                    <input type="range" min="0.25" max="0.5" step="0.05" value={hiresDenoise}
-                      onChange={e => { const v = +e.target.value; setHiresDenoise(v); patchIll({ hires_denoise: v }); }}
-                      className="w-full h-1 rounded accent-amber-500 cursor-pointer" />
-                    <div className="flex justify-between text-[9px]" style={{ color: "var(--text-secondary)" }}>
-                      <span>0.25（保留原構圖）</span><span>0.5（較大重繪）</span>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* ADetailer */}
-              <div className="flex flex-col gap-1.5">
-                <div className="flex items-center justify-between">
-                  <div className="flex flex-col">
-                    <span className="text-[10px] font-semibold" style={{ color: "var(--text-primary)" }}>ADetailer 臉部精修</span>
-                    <span className="text-[9px]" style={{ color: "var(--text-secondary)" }}>
-                      InsightFace 偵測臉部 → 局部 img2img 重繪 → 羽化貼回
-                    </span>
-                  </div>
-                  <button
-                    onClick={() => { setAdetailerEnabled(v => { patchIll({ adetailer_enabled: !v }); return !v; }); }}
-                    className={`relative w-9 h-5 rounded-full transition-colors ${adetailerEnabled ? "bg-amber-500" : "bg-white/20"}`}
-                  >
-                    <span className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${adetailerEnabled ? "translate-x-4" : ""}`} />
-                  </button>
-                </div>
-
-                {adetailerEnabled && (
-                  <div className="flex flex-col gap-1">
-                    <div className="flex justify-between text-[10px]" style={{ color: "var(--text-secondary)" }}>
-                      <span>重繪強度（Denoise）</span>
-                      <span className="font-mono font-bold text-amber-400">{adetailerDenoise.toFixed(2)}</span>
-                    </div>
-                    <input type="range" min="0.25" max="0.55" step="0.05" value={adetailerDenoise}
-                      onChange={e => { const v = +e.target.value; setAdetailerDenoise(v); patchIll({ adetailer_denoise: v }); }}
-                      className="w-full h-1 rounded accent-amber-500 cursor-pointer" />
-                    <div className="flex justify-between text-[9px]" style={{ color: "var(--text-secondary)" }}>
-                      <span>0.25（微調）</span><span>0.4（建議）</span><span>0.55（大重繪）</span>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {/* LoRA 模組 */}
-            <div className="flex flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] font-semibold" style={{ color: "var(--text-secondary)" }}>LoRA 模組</span>
-                <span className="text-[9px]" style={{ color: "var(--text-secondary)" }}>變更後需重新載入模型</span>
-              </div>
-              {availableLoras.length === 0 ? (
-                <div className="text-[10px] px-2.5 py-2 rounded border" style={{ borderColor: "var(--border)", color: "var(--text-secondary)", backgroundColor: "var(--bg-hover)" }}>
-                  找不到 LoRA（請將 .safetensors 放入 models/loras/）
-                </div>
-              ) : (
-                <div className="flex flex-col gap-1.5">
-                  {availableLoras.map(lora => {
-                    const state = getLoraState(lora.filename);
-                    const shortName = lora.filename.replace(/\.(safetensors|bin|pt)$/, "").slice(0, 32);
-                    return (
-                      <div key={lora.filename} className="flex flex-col gap-1 px-2.5 py-2 rounded border"
-                        style={{ borderColor: state.enabled ? "var(--border-accent, #f59e0b66)" : "var(--border)", backgroundColor: "var(--bg-hover)" }}>
-                        <div className="flex items-center gap-2">
-                          <button
-                            onClick={() => toggleLora(lora.filename)}
-                            className={`relative w-8 h-4 rounded-full transition-colors shrink-0 ${state.enabled ? "bg-amber-500" : "bg-white/20"}`}
-                          >
-                            <span className={`absolute top-0.5 left-0.5 w-3 h-3 bg-white rounded-full shadow transition-transform ${state.enabled ? "translate-x-4" : ""}`} />
-                          </button>
-                          <span className="flex-1 text-[10px] truncate" title={lora.filename} style={{ color: state.enabled ? "var(--text-primary)" : "var(--text-secondary)" }}>
-                            {shortName}
-                          </span>
-                          <span className="text-[9px] shrink-0" style={{ color: "var(--text-secondary)" }}>{lora.size_mb}MB</span>
-                        </div>
-                        {state.enabled && (
-                          <div className="flex items-center gap-2 mt-0.5">
-                            <span className="text-[9px] shrink-0" style={{ color: "var(--text-secondary)" }}>強度</span>
-                            <input type="range" min="0.1" max="1.5" step="0.05" value={state.weight}
-                              onChange={e => setLoraWeight(lora.filename, +e.target.value)}
-                              className="flex-1 h-1 rounded accent-amber-500 cursor-pointer" />
-                            <span className="text-[9px] font-mono w-7 text-right text-amber-400">{state.weight.toFixed(2)}</span>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-
-            {/* 反向提示詞 */}
-            <div className="flex flex-col gap-1.5">
-              <span className="text-[11px] font-semibold" style={{ color: "var(--text-secondary)" }}>反向提示詞（不希望出現的元素）</span>
-              <textarea
-                value={negativePrompt}
-                onChange={(e) => handleNegativePromptChange(e.target.value)}
-                placeholder="輸入不希望出現的元素，例如：extra limbs, blurry, watermark"
-                rows={3}
-                className="w-full px-2.5 py-2 rounded border text-[10px] outline-none resize-none"
-                style={{ backgroundColor: "var(--bg-surface)", borderColor: "var(--border)", color: "var(--text-primary)" }}
-              />
-              <span className="text-[9px] leading-relaxed" style={{ color: "var(--text-secondary)" }}>
-                修改後自動儲存（0.8 秒延遲），重啟後保留
-              </span>
+            {/* 進階生圖參數（步數/CFG/Hires/ADetailer/LoRA/VAE/反向提示詞）已統一移至
+                「模型管理 → 圖像生成」分頁，此處只保留閱讀當下的創作快捷。 */}
+            <div className="text-[9px] leading-relaxed px-2.5 py-2 rounded border" style={{ borderColor: "var(--border)", backgroundColor: "var(--bg-hover)", color: "var(--text-secondary)" }}>
+              步數、CFG、Hires、ADetailer、LoRA、VAE、反向提示詞等請至「模型管理 → 圖像生成」設定。
             </div>
           </section>
 

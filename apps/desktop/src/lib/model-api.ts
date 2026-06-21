@@ -15,6 +15,9 @@ export interface ModelInfo {
   source: string;
   is_active: boolean;
   is_loaded: boolean;
+  available?: boolean;   // 檔案是否實際存在於磁碟（登錄但未下載者為 false）
+  arch?: "sdxl" | "zimage" | "wan" | null;  // 圖像模型實際架構（即時偵測，檔名可能誤導）
+  is_turbo?: boolean;
 }
 
 export interface CategoryModels {
@@ -188,6 +191,35 @@ export async function setCivitaiToken(token: string): Promise<void> {
     body: JSON.stringify({ token }),
   });
   if (!res.ok) throw new Error("儲存 Token 失敗");
+}
+
+// ─── LLM 全域取樣設定 ──────────────────────────────────────────────────────────
+
+export interface LLMSettings {
+  override_enabled: boolean;
+  temperature: number;
+  top_p: number;
+  top_k: number;
+  repeat_penalty: number;
+  max_tokens: number | null;
+}
+
+export async function getLLMSettings(): Promise<LLMSettings> {
+  const res = await fetch(`${BASE_URL}/v1/llm/settings`);
+  if (!res.ok) throw new Error("取得 LLM 設定失敗");
+  return res.json();
+}
+
+export async function patchLLMSettings(patch: Partial<LLMSettings>): Promise<void> {
+  const res = await fetch(`${BASE_URL}/v1/llm/settings`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "更新 LLM 設定失敗");
+  }
 }
 
 export function formatBytes(bytes: number): string {

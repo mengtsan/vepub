@@ -283,7 +283,78 @@ def scan_local_models() -> int:
     return added
 
 
+def is_model_available(info: dict) -> bool:
+    """檢查模型檔案/目錄是否實際存在於磁碟。
+
+    registry 可能登錄了「曾新增但未下載」的項目（例如只填了 source URL、
+    size_bytes=0 的條目），這類在 UI 上不應顯示為可用、也不可被切換。
+    """
+    lp = info.get("local_path", "")
+    return bool(lp) and os.path.exists(lp)
+
+
+def verify_registry() -> dict:
+    """回傳各類別中「有登錄、但檔案不存在」的模型 id 清單。"""
+    reg = _load()
+    missing: dict = {}
+    for cat in ("tts", "image", "llm"):
+        models = reg.get(cat, {}).get("models", {})
+        miss = [mid for mid, info in models.items() if not is_model_available(info)]
+        if miss:
+            missing[cat] = miss
+    return missing
+
+
+def _is_orphan(info: dict) -> bool:
+    """孤兒條目：檔案不存在「且」沒有下載來源（無法復原）。
+
+    缺檔但帶 source（下載連結）的屬「預設/已知來源」，保留並在 UI 提供下載，不算孤兒。
+    """
+    return not is_model_available(info) and not info.get("source")
+
+
+def normalize_active_pointers() -> bool:
+    """將指向「孤兒條目」的 active 指標改指到該類別第一個可用模型（無則 None）。
+
+    缺檔但有下載來源的「預設」保留不動（例如 llm.analysis = 未下載但可下載的 AEON），
+    讓使用者仍能看到並下載它。回傳是否有變動。
+    """
+    reg = _load()
+    changed = False
+
+    for cat in ("image", "tts"):
+        c = reg.get(cat, {})
+        models = c.get("models", {})
+        mid = c.get("active")
+        if mid and _is_orphan(models.get(mid, {})):
+            avail = next((k for k, v in models.items() if is_model_available(v)), None)
+            print(f"[registry] {cat}.active {mid!r} 為孤兒條目 → 改為 {avail!r}")
+            c["active"] = avail
+            changed = True
+
+    lc = reg.get("llm", {})
+    lmodels = lc.get("models", {})
+    for role in ("chat", "analysis"):
+        mid = lc.get(role)
+        if mid and _is_orphan(lmodels.get(mid, {})):
+            avail = next((k for k, v in lmodels.items() if is_model_available(v)), None)
+            print(f"[registry] llm.{role} {mid!r} 為孤兒條目 → 改為 {avail!r}")
+            lc[role] = avail
+            changed = True
+
+    if changed:
+        _save(reg)
+    return changed
+
+
 def ensure_initialized() -> None:
     """確保登錄檔存在，並掃描本機模型（main.py lifespan 呼叫）。"""
     _load()
     scan_local_models()
+
+    # 啟動前檢查：登錄但檔案不存在的模型，並把指向它們的 active 指標導正到可用模型。
+    missing = verify_registry()
+    if missing:
+        for cat, ids in missing.items():
+            print(f"[registry] ⚠ {cat} 已登錄但檔案不存在（UI 將不顯示）: {ids}")
+        normalize_active_pointers()
