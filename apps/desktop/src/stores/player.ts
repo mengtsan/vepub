@@ -7,6 +7,8 @@ export interface Sentence {
   charStart: number;
   charEnd: number;
   cfi?: string; // 保存當前句子在 epub 內部的 CFI 定位
+  speaker?: string | null;      // 角色配音：歸屬到的角色名
+  voiceInstruct?: string | null; // 該角色的聲線 instruct
 }
 
 // 語音合成模式

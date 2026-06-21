@@ -2,6 +2,43 @@
 
 ---
 
+## 2026-06-21 — TTS Phase 2 角色配音：對白歸屬角色、依角色庫 gender/age 配聲線
+
+承 Phase 0+1（旁白/對白自我錨定），這輪把對白進一步**歸屬到具體角色**，讓有聲書變成「一人一聲線」的全卡司——而且複用角色庫既有的 `gender`/`age_hint`，使用者零額外輸入。
+
+### 核心洞察
+
+角色分析時已填好的 `gender`（男/女）+ `age_hint`（幼兒/青年/中年/老年）**剛好就是 OmniVoice Voice Design instruct 需要的**（male/female + child/young adult/middle-aged/elderly）。同一份角色資料，原本驅動生圖一致性，現在也驅動聲線一致性。
+
+### 後端
+
+- **`services/tts_voice.py`（新）**：
+  - `character_voice_instruct(gender, age_hint, name)` → 如 `"female, young adult, high pitch"`；同性別年齡者以**名字 hash 配不同音高**避免同聲（男聲偏低、女聲偏高的鄰近範圍微調）。
+  - `attribute_speakers(sentences, names)` → 啟發式歸屬：引號標對白 + `名字+說話動詞`（說/道/問/笑道/低聲…）比對；回看前句**僅限旁白引言**（無引號，如「小巧問：」），避免從前一句對白延續造成「你一句我一句」交替誤判。保守、寧缺勿錯——無明確線索的對白不指名，退回通用對白聲線。**刻意獨立成模組，日後可整支換成 LLM 歸屬而不動其餘管線。**
+- **`routers/epub.py`**：`get_sentences` 整合 `_attach_character_voices`——查角色庫 → 歸屬 → 把 `speaker`/`instruct` 附到每句（執行緒池跑、受開關控制、失敗則靜默退回）。
+- **`services/tts_engine.py`**：`_synthesize_sync` 加 `speaker`；**錨定鍵改為 speaker（角色）優先**（無則退回旁白/對白）；把原本獨立的 Voice Design 分支併入錨定路徑——instruct 作為該角色「首句」聲線種子，錨定後改用 voice_clone_prompt 重用。即使角色無 gender/age，仍以名字為鍵錨定一個一致（隨機）聲線。
+- **`services/tts_settings.py`**：`character_voices`（預設 True，可關回 Phase 1）。
+- `tts_omnivoice.py`、`routers/tts.py`：全鏈轉發 `speaker`。
+
+### 前端
+
+`api.ts`/`player.ts` 的 Sentence 型別加 `speaker`/`instruct`（`voiceInstruct`）；`Reader.tsx` 對應；`useAudioStream.ts` 自動模式下帶上 `speaker`+`instruct`；`SettingsPanel` 加**「角色配音」開關**（綁 `character_voices`）。
+
+### 驗證（皆通過）
+
+- 聲線映射：秋月 `female, young adult, high pitch`、王老太后 `male, elderly, very low pitch`、同性別年齡不同名音高有別。
+- 歸屬：旁白 / 同句具名（秋月說道「…」）/ 交替對白（前句對白→不延續）/ 旁白引言帶出（小巧問：→「…」）/ 引號後具名（「…」秋月說）全正確。
+- 引擎：秋月→錨定→重用、小巧→獨立錨定、旁白→narrator，三鍵並存。
+- 端點實測：真實角色「秋月（女/青年）」→ `speaker=秋月, instruct=female, young adult, high pitch`。
+- `tsc --noEmit` 僅 2 個既有 `IllustrationTest.tsx` 錯誤；ruff 零新增。
+
+### 限制與後續
+
+- 啟發式歸屬覆蓋率有限（中文常省略「某某說」）；無明確線索者不指名（不誤判）。升級路徑：把 `attribute_speakers` 換成複用角色分析 pipeline 的 LLM 版本。
+- **待實機聽感驗證**：`npm run dev` 後找有對白的章節，確認不同角色聽起來相異、同角色一致。
+
+---
+
 ## 2026-06-21 — TTS 一致性：朗讀語系下拉、旁白/對白自我錨定聲線（Phase 0+1）、播放往回跳修復
 
 承接上一輪 OmniVoice 落地，這輪聚焦「聽起來對不對」——語系可選、音色逐句一致，並修掉一個既有的播放競態。

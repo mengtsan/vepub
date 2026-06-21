@@ -191,6 +191,8 @@ export default function Reader() {
           text: s.text,
           charStart: s.char_start,
           charEnd: s.char_end,
+          speaker: s.speaker ?? null,
+          voiceInstruct: s.instruct ?? null,
         }));
 
         loadSentences(formatted);

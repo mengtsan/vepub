@@ -100,6 +100,14 @@ export function useAudioStream(onChapterEnded?: () => void) {
       if (refText) payload.ref_text = refText;
     } else if (ttsMode === "design" && instruct) {
       payload.instruct = instruct;
+    } else {
+      // 自動模式：角色配音（Phase 2）——該句若已歸屬角色，帶上 speaker 錨定鍵
+      // 與其聲線 instruct；後端首句以 instruct 取聲、之後重用同一聲線。
+      const s = sentences[index];
+      if (s.speaker) {
+        payload.speaker = s.speaker;
+        if (s.voiceInstruct) payload.instruct = s.voiceInstruct;
+      }
     }
 
     if (duration !== null) {

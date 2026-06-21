@@ -197,6 +197,7 @@ class TTSEngine:
         duration: float | None = None,
         num_step: int = 32,
         language: str | None = None,
+        speaker: str | None = None,
     ):
         """
         非同步產生 PCM 位元組（int16, 24kHz, 單聲道）。
@@ -229,7 +230,7 @@ class TTSEngine:
                 audio_np = await loop.run_in_executor(
                     None,
                     self._synthesize_sync,
-                    text, ref_audio_path, ref_text, instruct, speed, duration, num_step, language
+                    text, ref_audio_path, ref_text, instruct, speed, duration, num_step, language, speaker
                 )
         finally:
             gpu_manager.release_gpu()
@@ -253,10 +254,14 @@ class TTSEngine:
         duration: float | None,
         num_step: int,
         language: str | None = None,
+        speaker: str | None = None,
     ) -> np.ndarray:
         """
         呼叫模型進行語音合成的同步實作，回傳 numpy float32 陣列。
         根據提供的參數自動決定使用 Voice Cloning / Voice Design / Auto 模式。
+
+        speaker 為錨定鍵（Phase 2 角色配音）：同一角色固定一個聲線；
+        instruct 在該角色「首句」作為聲線種子（如 'female, young adult'），錨定後重用。
         """
         from omnivoice.models.omnivoice import OmniVoiceGenerationConfig
 
@@ -281,34 +286,35 @@ class TTSEngine:
             kwargs["language"] = lang
             logger.debug("語言: %s（%s）", lang, src)
 
-        # 若設定後再決定是否要建立錨定（僅 Auto 模式）。
-        pending_anchor_role: str | None = None
+        # 待錨定的鍵（None 表示本句不需要建立錨定）。
+        pending_anchor_key: str | None = None
 
-        # Voice Cloning 模式：提供參考音訊
+        # Voice Cloning 模式：提供參考音訊（直接複製，不走自我錨定）
         if ref_audio_path:
             kwargs["ref_audio"] = ref_audio_path
             if ref_text:
                 kwargs["ref_text"] = ref_text
             logger.debug("模式: Voice Cloning | ref_audio=%s...", ref_audio_path[:30])
 
-        # Voice Design 模式：提供聲音描述
-        elif instruct:
-            kwargs["instruct"] = instruct
-            logger.debug("模式: Voice Design | instruct='%s'", instruct)
-
-        # Auto 模式：旁白/對白各自「自我錨定」一個固定聲線（Phase 0+1）。
-        # 同一 role 首次合成後，用其輸出建 voice_clone_prompt 快取，後續重用 → 音色一致。
+        # Voice Design / Auto：以 speaker（角色，Phase 2）或旁白/對白（Phase 1）為鍵
+        # 自我錨定聲線。instruct（角色聲線設計或使用者描述）作為該鍵「首句」的聲線種子，
+        # 錨定後即改用 voice_clone_prompt 重用，確保同一角色音色一致。
         else:
             from services.tts_settings import get_settings as _tts_get
-            role = classify_segment(text)
+            key = speaker or classify_segment(text)
             if _tts_get().voice_consistency:
-                anchor = self._voice_anchors.get(role)
+                anchor = self._voice_anchors.get(key)
                 if anchor is not None:
                     kwargs["voice_clone_prompt"] = anchor
-                    logger.debug("模式: Auto/%s（重用錨定聲線）", role)
+                    logger.debug("聲線: %s（重用錨定）", key)
                 else:
-                    pending_anchor_role = role
-                    logger.debug("模式: Auto/%s（首次，待錨定）", role)
+                    if instruct:
+                        kwargs["instruct"] = instruct
+                    pending_anchor_key = key
+                    logger.debug("聲線: %s（首次%s，待錨定）", key, "/instruct" if instruct else "")
+            elif instruct:
+                kwargs["instruct"] = instruct
+                logger.debug("模式: Voice Design | instruct='%s'", instruct)
             else:
                 logger.debug("模式: Auto（一致性關閉，每句隨機）")
 
@@ -330,9 +336,9 @@ class TTSEngine:
             audio = audio.numpy()
         audio = np.asarray(audio, dtype=np.float32)
 
-        # 建立錨定：首次該 role 的輸出夠長（≥0.5s）才拿來當聲線參考，避免用過短片段。
-        if pending_anchor_role is not None and len(audio) >= int(self.sample_rate * 0.5):
-            self._anchor_voice(pending_anchor_role, audio, text)
+        # 建立錨定：首次該鍵的輸出夠長（≥0.5s）才拿來當聲線參考，避免用過短片段。
+        if pending_anchor_key is not None and len(audio) >= int(self.sample_rate * 0.5):
+            self._anchor_voice(pending_anchor_key, audio, text)
 
         return audio
 

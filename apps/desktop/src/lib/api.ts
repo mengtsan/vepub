@@ -40,6 +40,8 @@ export interface Sentence {
   text: string;
   char_start: number;
   char_end: number;
+  speaker?: string | null;    // 角色配音：歸屬到的角色名（None=旁白/未歸屬）
+  instruct?: string | null;   // 該角色的聲線 instruct（gender/age 推得）
 }
 
 export interface HardwareInfo {

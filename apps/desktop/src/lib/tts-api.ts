@@ -5,6 +5,7 @@ const BASE = `${BACKEND_BASE_URL}/v1/audio`;
 export interface TTSSettings {
   forced_language: string | null;
   voice_consistency: boolean;
+  character_voices: boolean;
 }
 
 /** 取得 TTS 全域設定。 */

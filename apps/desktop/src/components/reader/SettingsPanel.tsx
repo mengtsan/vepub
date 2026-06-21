@@ -79,13 +79,17 @@ export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // 聲線一致（後端全域設定 voice_consistency）與「重新隨機旁白聲音」
+  // 聲線一致 / 角色配音（後端全域設定）與「重新隨機旁白聲音」
   const [voiceConsistency, setVoiceConsistency] = useState(true);
+  const [characterVoices, setCharacterVoices] = useState(true);
   const [rerolling, setRerolling] = useState(false);
   useEffect(() => {
     if (!isOpen) return;
     getTTSSettings()
-      .then(s => setVoiceConsistency(s.voice_consistency))
+      .then(s => {
+        setVoiceConsistency(s.voice_consistency);
+        setCharacterVoices(s.character_voices);
+      })
       .catch(() => {});
   }, [isOpen]);
 
@@ -93,6 +97,12 @@ export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
     const next = !voiceConsistency;
     setVoiceConsistency(next);
     patchTTSSettings({ voice_consistency: next }).catch(() => setVoiceConsistency(!next));
+  };
+
+  const toggleCharacterVoices = () => {
+    const next = !characterVoices;
+    setCharacterVoices(next);
+    patchTTSSettings({ character_voices: next }).catch(() => setCharacterVoices(!next));
   };
 
   const handleReroll = async () => {
@@ -341,6 +351,26 @@ export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
                 >
                   <span
                     className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${voiceConsistency ? "translate-x-4" : ""}`}
+                  />
+                </span>
+              </button>
+
+              {/* 角色配音（依角色庫 gender/age 為對白分配聲線）*/}
+              <button
+                onClick={toggleCharacterVoices}
+                className="flex items-center justify-between w-full"
+              >
+                <div className="flex flex-col items-start">
+                  <span style={{ color: "var(--text-secondary)" }}>角色配音</span>
+                  <span className="text-[9px] text-left" style={{ color: "var(--text-secondary)" }}>
+                    依角色庫的性別/年齡，為對白分配不同聲線
+                  </span>
+                </div>
+                <span
+                  className={`relative w-9 h-5 rounded-full shrink-0 transition-colors ${characterVoices ? "bg-amber-500" : "bg-white/20"}`}
+                >
+                  <span
+                    className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${characterVoices ? "translate-x-4" : ""}`}
                   />
                 </span>
               </button>

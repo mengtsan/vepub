@@ -24,6 +24,9 @@ class TTSSettings(BaseModel):
     # 自我錨定聲線（Phase 0+1）：Auto 模式下旁白/對白各固定一個聲線，避免逐句音色飄移。
     # 關閉則回復每句獨立隨機。
     voice_consistency: bool = True
+    # 角色配音（Phase 2）：句子端點依角色庫把對白歸屬到角色，並用其 gender/age 配聲線。
+    # 關閉則只分旁白/對白（Phase 1）。
+    character_voices: bool = True
 
 
 _settings = TTSSettings()

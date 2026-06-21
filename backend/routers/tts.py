@@ -73,6 +73,7 @@ class SpeechRequest(BaseModel):
     duration: float | None = None
     num_step: int = 32
     language: str | None = None   # None = 後端依文字內容自動偵測（中文→'zh'）
+    speaker: str | None = None    # 說話者錨定鍵（角色配音）；None = 旁白/對白自動分流
 
 
 @router.post("/speech")
@@ -89,6 +90,7 @@ async def create_speech(req: SpeechRequest, request: Request):
         duration=req.duration,
         num_step=req.num_step,
         language=req.language,
+        speaker=req.speaker,
     ):
         chunks.append(chunk)
     audio_bytes = b"".join(chunks)
@@ -151,6 +153,7 @@ async def audio_stream(websocket: WebSocket):
                 duration      = data.get("duration") or None
                 num_step      = int(data.get("num_step", 32))
                 language      = data.get("language") or None
+                speaker       = data.get("speaker") or None
 
                 logger.debug("合成 index=%d request_id=%s text='%s'",
                              sentence_index, request_id, text[:20])
@@ -173,6 +176,7 @@ async def audio_stream(websocket: WebSocket):
                         duration=duration,
                         num_step=num_step,
                         language=language,
+                        speaker=speaker,
                     ):
                         if cancel_event.is_set():
                             cancelled = True

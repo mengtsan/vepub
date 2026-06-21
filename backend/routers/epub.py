@@ -278,18 +278,55 @@ async def get_sentences(
         chunker = TextChunker(language=language)
         return chunker.chunk_paragraphs(paragraphs)
     sentences = await loop.run_in_executor(None, _chunk)
-    return {
-        "sentences": [
-            {
-                "index": s.index,
-                "paragraph_index": s.paragraph_index,
-                "text": s.text,
-                "char_start": s.char_start,
-                "char_end": s.char_end,
-            }
-            for s in sentences
-        ]
-    }
+    out = [
+        {
+            "index": s.index,
+            "paragraph_index": s.paragraph_index,
+            "text": s.text,
+            "char_start": s.char_start,
+            "char_end": s.char_end,
+        }
+        for s in sentences
+    ]
+    # Phase 2 角色配音：歸屬每句說話者並附上聲線 instruct（在執行緒池跑，含 DB 查詢）。
+    await loop.run_in_executor(None, _attach_character_voices, book_id, out)
+    return {"sentences": out}
+
+
+def _attach_character_voices(book_id: str, sentences: list[dict]) -> None:
+    """就地為每句加上 speaker（角色名|None）與 instruct（該角色聲線|None）。
+
+    受 tts_settings.character_voices 開關控制；關閉或無角色時不附加（前端退回旁白/對白）。
+    """
+    try:
+        from services.tts_settings import get_settings as _tts_get
+        if not _tts_get().character_voices:
+            return
+        from services.tts_voice import attribute_speakers, character_voice_instruct
+
+        conn = get_db_connection()
+        try:
+            rows = conn.execute(
+                "SELECT name, gender, age_hint FROM characters WHERE book_id=?",
+                (book_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        chars = {r["name"]: dict(r) for r in rows if r["name"]}
+        if not chars:
+            return
+
+        speakers = attribute_speakers(sentences, list(chars.keys()))
+        for sent, who in zip(sentences, speakers):
+            if not who:
+                continue
+            c = chars.get(who, {})
+            sent["speaker"] = who
+            sent["instruct"] = character_voice_instruct(
+                c.get("gender"), c.get("age_hint"), who
+            )
+    except Exception as e:
+        logger.warning("角色配音歸屬失敗（略過，退回旁白/對白）: %s", e)
 
 @router.get("/{book_id}/progress")
 async def get_progress(book_id: str):

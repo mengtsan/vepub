@@ -31,6 +31,7 @@ class OmniVoiceBackend:
         duration: float | None = None,
         num_step: int = 32,
         language: str | None = None,
+        speaker: str | None = None,
         **kwargs,
     ):
         async for chunk in self._engine.synthesize_stream(
@@ -42,5 +43,6 @@ class OmniVoiceBackend:
             duration=duration,
             num_step=num_step,
             language=language,
+            speaker=speaker,
         ):
             yield chunk
