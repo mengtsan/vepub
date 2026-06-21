@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 class TTSSettings(BaseModel):
     # 優先手動語系：覆寫自動偵測。None / "auto" = 不強制。
     forced_language: str | None = None
+    # 自我錨定聲線（Phase 0+1）：Auto 模式下旁白/對白各固定一個聲線，避免逐句音色飄移。
+    # 關閉則回復每句獨立隨機。
+    voice_consistency: bool = True
 
 
 _settings = TTSSettings()

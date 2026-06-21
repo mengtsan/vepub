@@ -2,6 +2,43 @@
 
 ---
 
+## 2026-06-21 — TTS 一致性：朗讀語系下拉、旁白/對白自我錨定聲線（Phase 0+1）、播放往回跳修復
+
+承接上一輪 OmniVoice 落地，這輪聚焦「聽起來對不對」——語系可選、音色逐句一致，並修掉一個既有的播放競態。
+
+### 1. 朗讀語系下拉（前端，A 方案：逐次播放覆寫）
+
+後端 `language` 接線上輪已備妥，這輪補前端：`stores/player.ts` 加 `language: string | null`（預設 null=自動）＋ setter；`SettingsPanel.tsx`「語音合成設定」段新增**朗讀語系下拉**（自動偵測 / 普通話 / 粵語 / 日文 / 英文 / 韓文）；`useAudioStream.ts` 的 WS payload 補 `if (language) payload.language = language`。選定即逐句帶入，後端優先採用。
+
+### 2. 「每句音色都不同」根因與修復（Phase 0+1）
+
+**現象**：一段文字逐句播放，每句音色/語氣都不一樣。
+
+**根因**：OmniVoice Auto 模式下，每次 `generate()` 先用**隨機聲音**生成 chunk 0 再以它為參考（`omnivoice.py:872-890`），所以單次呼叫內部一致；但閱讀器**逐句一次 `generate()`**，每句都重新隨機 → 每句一個聲音。官方無 seed，唯一一致機制是 `create_voice_clone_prompt()`。
+
+**修法（自我錨定）**：`tts_engine.py` 為**旁白**與**對白**各維護一個 `VoiceClonePrompt` 快取。Auto 模式下某 role 首次合成後（輸出≥0.5s），用其音訊建 prompt 快取；後續同 role 重用 → 音色一致。引擎 `self._lock` 已序列化合成，「先錨定後重用」天然無競態。
+
+- Phase 1 用全形引號`「『“`粗分旁白/對白（`classify_segment`）；角色歸屬留待 Phase 2。
+- `tts_settings.py` 加 `voice_consistency`（預設 True，可關回每句隨機）；卸載/換模型時清空錨定（prompt 綁定當前 tokenizer）。
+- `POST /v1/audio/voice/reset` 重新取聲（不喜歡目前隨機到的旁白）。
+- 前端：`lib/tts-api.ts`（get/patch settings、reset）；`SettingsPanel` 加**「聲線一致」開關**與**「⟳ 重新隨機旁白聲音」按鈕**。
+
+### 3. 從第 N 句開始播放會「往回跳」5→6→7→5→6→7
+
+**現象**：從第 5 句起播，會週期性跳回重播。後端日誌顯示**同時兩條 WebSocket**。
+
+**根因**：`useAudioStream.ts` 兩個 effect——A 監 `isPlaying`、B 監 `currentSentenceIndex`。從非 0 句起播時，兩者在同一次 render 一起變，A、B 都呼叫 `connectAndPlay()`；而其 guard 只擋 `OPEN`，第一條還在 `CONNECTING` 時被放行 → 開出第二條 WS → 兩股 5,6,7 交錯播。從第 0 句起播因 `currentSentenceIndex` 未變、Effect B 不觸發，故無此問題。
+
+**修法**：guard 同時擋 `CONNECTING` 與 `OPEN`。順帶消除每句被合成兩次的浪費。屬既有競態，與本輪 language/錨定無關。
+
+### 驗證
+
+- 後端：`classify_segment` 旁白/對白正確；旁白首句錨定→次句重用→對白獨立錨定→reset 清空，全綠；ruff 零新增問題。
+- 前端：`tsc --noEmit` 僅剩 2 個既有 `IllustrationTest.tsx` 錯誤，本輪改動零錯誤。
+- **待實機**：雙 WS 修復需 `npm run dev` 後從第 5 句起播確認日誌只剩一條連線、播放不再往回跳。
+
+---
+
 ## 2026-06-21 — TTS/OmniVoice 落地：模型目錄統一、registry 整併、粵語發音修復、優先語系設定
 
 以「模型目錄是否合理」為起點，一路延伸到 TTS 實裝與發音修錯。核心是把散落的模型路徑收斂成 `models/<category>/` 分類佈局，並讓 TTS 真正納入統一的 registry 管理。

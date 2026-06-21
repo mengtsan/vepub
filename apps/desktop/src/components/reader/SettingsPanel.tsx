@@ -2,10 +2,11 @@ import React, { useState, useEffect, useRef } from "react";
 import { useReaderStore } from "@/stores/reader";
 import { usePlayerStore } from "@/stores/player";
 import { getAllModels } from "@/lib/model-api";
+import { getTTSSettings, patchTTSSettings, resetVoiceAnchors } from "@/lib/tts-api";
 import {
   X, Sliders, Type, Volume2, HardDrive,
   Mic, Wand2, Bot, ChevronDown, ChevronUp,
-  CheckCircle2, UploadCloud, ImagePlus
+  CheckCircle2, UploadCloud, ImagePlus, RefreshCw
 } from "lucide-react";
 import { TTSMode } from "@/stores/player";
 
@@ -26,6 +27,17 @@ const STYLE_PRESETS: { label: string; value: string; style: PresetStyle }[] = [
   { label: "插畫厚塗", value: "digital painting, painterly, soft cinematic lighting, concept art",   style: "real"  },
   { label: "油畫",     value: "oil painting, thick brush strokes, classical, rich texture",         style: "real"  },
   { label: "賽博龐克", value: "cyberpunk, neon lights, futuristic, high contrast, atmospheric",      style: "real"  },
+];
+
+// 朗讀語系：value 為 OmniVoice 語言 ID（空字串＝自動偵測，前端送出時轉為不帶 language）。
+// 中文與粵語共用漢字，自動偵測偶爾會誤判，提供手動覆寫。
+const LANGUAGE_OPTIONS: { label: string; value: string }[] = [
+  { label: "自動偵測", value: "" },
+  { label: "普通話",   value: "zh" },
+  { label: "粵語",     value: "yue" },
+  { label: "日文",     value: "ja" },
+  { label: "英文",     value: "en" },
+  { label: "韓文",     value: "ko" },
 ];
 
 export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
@@ -54,16 +66,42 @@ export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
     instruct,
     numStep,
     duration,
+    language,
     setTTSMode,
     setRefAudioPath,
     setRefText,
     setInstruct,
     setNumStep,
     setDuration,
+    setLanguage,
   } = usePlayerStore();
 
   const [showAdvanced, setShowAdvanced] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // 聲線一致（後端全域設定 voice_consistency）與「重新隨機旁白聲音」
+  const [voiceConsistency, setVoiceConsistency] = useState(true);
+  const [rerolling, setRerolling] = useState(false);
+  useEffect(() => {
+    if (!isOpen) return;
+    getTTSSettings()
+      .then(s => setVoiceConsistency(s.voice_consistency))
+      .catch(() => {});
+  }, [isOpen]);
+
+  const toggleVoiceConsistency = () => {
+    const next = !voiceConsistency;
+    setVoiceConsistency(next);
+    patchTTSSettings({ voice_consistency: next }).catch(() => setVoiceConsistency(!next));
+  };
+
+  const handleReroll = async () => {
+    setRerolling(true);
+    try {
+      await resetVoiceAnchors();
+    } catch { /* 忽略：後端可能尚未載入 */ }
+    setTimeout(() => setRerolling(false), 600);
+  };
 
   // 已設定生圖風格的集合（與 ModelManager 的 anime/real 打通）：
   // 缺對應風格模型時，該組畫風前綴停用，避免選了卻找不到模型。
@@ -262,6 +300,61 @@ export default function SettingsPanel({ isOpen, onClose }: SettingsPanelProps) {
                 onChange={(e) => setSpeed(parseFloat(e.target.value))}
                 className="w-full h-1 rounded bg-white/15 accent-amber-500 cursor-pointer"
               />
+            </div>
+
+            {/* 朗讀語系 */}
+            <div className="flex flex-col gap-1.5 text-xs">
+              <span style={{ color: "var(--text-secondary)" }}>朗讀語系</span>
+              <select
+                value={language ?? ""}
+                onChange={(e) => setLanguage(e.target.value || null)}
+                className="w-full px-2.5 py-2 rounded border text-xs outline-none cursor-pointer"
+                style={{
+                  backgroundColor: "var(--bg-surface)",
+                  borderColor: "var(--border)",
+                  color: "var(--text-primary)",
+                }}
+              >
+                {LANGUAGE_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+              <span className="text-[9px]" style={{ color: "var(--text-secondary)" }}>
+                自動偵測時，中文會以普通話朗讀；如遇誤判可手動指定
+              </span>
+            </div>
+
+            {/* 聲線一致（自動模式：旁白/對白各固定一個聲線，避免逐句音色飄移）*/}
+            <div className="flex flex-col gap-2 text-xs">
+              <button
+                onClick={toggleVoiceConsistency}
+                className="flex items-center justify-between w-full"
+              >
+                <div className="flex flex-col items-start">
+                  <span style={{ color: "var(--text-secondary)" }}>聲線一致</span>
+                  <span className="text-[9px] text-left" style={{ color: "var(--text-secondary)" }}>
+                    自動模式下，旁白與對白各固定一個聲線
+                  </span>
+                </div>
+                <span
+                  className={`relative w-9 h-5 rounded-full shrink-0 transition-colors ${voiceConsistency ? "bg-amber-500" : "bg-white/20"}`}
+                >
+                  <span
+                    className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${voiceConsistency ? "translate-x-4" : ""}`}
+                  />
+                </span>
+              </button>
+
+              {/* 重新隨機旁白/對白聲音 */}
+              <button
+                onClick={handleReroll}
+                disabled={!voiceConsistency || rerolling}
+                className="flex items-center justify-center gap-1.5 py-1.5 rounded border text-[10px] transition-all disabled:opacity-35 disabled:cursor-not-allowed hover:bg-white/5"
+                style={{ borderColor: "var(--border)", color: "var(--text-secondary)" }}
+              >
+                <RefreshCw size={11} className={rerolling ? "animate-spin" : ""} />
+                {rerolling ? "重新取聲中…" : "重新隨機旁白聲音"}
+              </button>
             </div>
 
             {/* 語音模式選擇 */}

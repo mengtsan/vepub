@@ -28,6 +28,7 @@ interface PlayerState {
   instruct: string;        // Voice Design：聲音屬性描述
   numStep: number;         // 擴散步數（16 或 32）
   duration: number | null; // 固定輸出時長（秒），null 表示不限制
+  language: string | null; // 朗讀語系（OmniVoice ID，如 'zh'）；null = 後端自動偵測
 
   // WebSocket 連線實例
   ws: WebSocket | null;
@@ -51,6 +52,7 @@ interface PlayerState {
   setInstruct: (instruct: string) => void;
   setNumStep: (numStep: number) => void;
   setDuration: (duration: number | null) => void;
+  setLanguage: (language: string | null) => void;
 }
 
 export const usePlayerStore = create<PlayerState>((set, get) => ({
@@ -69,6 +71,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   instruct: "",
   numStep: 16,
   duration: null,
+  language: null,
 
   play: () => set({ isPlaying: true }),
   pause: () => {
@@ -105,4 +108,5 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   setInstruct: (instruct) => set({ instruct }),
   setNumStep: (numStep) => set({ numStep }),
   setDuration: (duration) => set({ duration }),
+  setLanguage: (language) => set({ language }),
 }));

@@ -38,6 +38,7 @@ export function useAudioStream(onChapterEnded?: () => void) {
     instruct,
     numStep,
     duration,
+    language,
     _setCurrentIndex,
     setWs,
     setIsLoading,
@@ -105,9 +106,14 @@ export function useAudioStream(onChapterEnded?: () => void) {
       payload.duration = duration;
     }
 
+    // 朗讀語系：null = 交後端自動偵測；指定時優先採用
+    if (language) {
+      payload.language = language;
+    }
+
     ws.send(JSON.stringify(payload));
     sentQueueRef.current.push(index);
-  }, [sentences, speed, ttsMode, refAudioPath, refText, instruct, numStep, duration]);
+  }, [sentences, speed, ttsMode, refAudioPath, refText, instruct, numStep, duration, language]);
 
   // 處理文字訊息（sentence_start/end/cancelled/error），依 request_id 過濾過期回應
   const handleTextMessage = useCallback((msg: any, ws: WebSocket) => {
@@ -200,7 +206,17 @@ export function useAudioStream(onChapterEnded?: () => void) {
   }, [onChapterEnded, _setCurrentIndex, setIsLoading]);
 
   const connectAndPlay = useCallback(() => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
+    // 已有連線「正在建立(CONNECTING)或已開啟(OPEN)」就不再開新的。
+    // 從非 0 句開始播放時，isPlaying 與 currentSentenceIndex 會同一次 render 一起變，
+    // 使 Effect A 與 Effect B 都呼叫 connectAndPlay；若只擋 OPEN，第一條還在 CONNECTING
+    // 時會被放行而開出第二條 WS，造成兩股音訊交錯（聽起來像往回跳）。
+    if (
+      wsRef.current &&
+      (wsRef.current.readyState === WebSocket.OPEN ||
+        wsRef.current.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
 
     stopAllAudio();
     sentQueueRef.current = [];

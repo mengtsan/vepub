@@ -45,6 +45,16 @@ def detect_language(text: str) -> str | None:
     return None
 
 
+# 對白標記：中日全形引號。用於 Phase 1 旁白/對白分流——含引號者視為對白，
+# 其餘為旁白。中文小說常省略「某某說」，故先以引號這個最穩定的線索粗分。
+_RE_DIALOGUE = re.compile(r"[「『“]")
+
+
+def classify_segment(text: str) -> str:
+    """將一句粗分為 'dialogue'（含引號）或 'narrator'（旁白）。"""
+    return "dialogue" if _RE_DIALOGUE.search(text or "") else "narrator"
+
+
 class TTSEngine:
     def __init__(self, device: str = "auto", local_path: str | None = None):
         self.device = device
@@ -54,6 +64,14 @@ class TTSEngine:
         self.model = None
         self.sample_rate = 24000
         self._lock = asyncio.Lock()
+        # 自我錨定聲線（Phase 0+1）：role('narrator'/'dialogue') → VoiceClonePrompt。
+        # Auto 模式下首次合成某 role 後即固定其聲線，後續重用以保持音色一致。
+        self._voice_anchors: dict[str, object] = {}
+
+    def reset_voice_anchors(self) -> None:
+        """清除已錨定的旁白/對白聲線，下次合成重新隨機。"""
+        self._voice_anchors.clear()
+        logger.info("已重置自我錨定聲線（旁白/對白）")
 
     async def load(self):
         """
@@ -130,6 +148,9 @@ class TTSEngine:
         釋放目前已載入的模型記憶體資源。
         """
         import gc
+
+        # 錨定聲線是依當前模型 tokenizer 建立的，換模型/卸載時必須一併清除。
+        self._voice_anchors.clear()
 
         if self.model is not None:
             logger.info("正在卸載 TTS 模型")
@@ -260,6 +281,9 @@ class TTSEngine:
             kwargs["language"] = lang
             logger.debug("語言: %s（%s）", lang, src)
 
+        # 若設定後再決定是否要建立錨定（僅 Auto 模式）。
+        pending_anchor_role: str | None = None
+
         # Voice Cloning 模式：提供參考音訊
         if ref_audio_path:
             kwargs["ref_audio"] = ref_audio_path
@@ -272,9 +296,21 @@ class TTSEngine:
             kwargs["instruct"] = instruct
             logger.debug("模式: Voice Design | instruct='%s'", instruct)
 
-        # Auto 模式：使用模型預設聲音
+        # Auto 模式：旁白/對白各自「自我錨定」一個固定聲線（Phase 0+1）。
+        # 同一 role 首次合成後，用其輸出建 voice_clone_prompt 快取，後續重用 → 音色一致。
         else:
-            logger.debug("模式: Auto（使用模型預設聲音）")
+            from services.tts_settings import get_settings as _tts_get
+            role = classify_segment(text)
+            if _tts_get().voice_consistency:
+                anchor = self._voice_anchors.get(role)
+                if anchor is not None:
+                    kwargs["voice_clone_prompt"] = anchor
+                    logger.debug("模式: Auto/%s（重用錨定聲線）", role)
+                else:
+                    pending_anchor_role = role
+                    logger.debug("模式: Auto/%s（首次，待錨定）", role)
+            else:
+                logger.debug("模式: Auto（一致性關閉，每句隨機）")
 
         # 若設定固定輸出時長，優先使用（會覆蓋 speed）
         if duration is not None:
@@ -292,4 +328,23 @@ class TTSEngine:
         # 確保回傳 numpy float32 陣列
         if hasattr(audio, "numpy"):
             audio = audio.numpy()
-        return np.asarray(audio, dtype=np.float32)
+        audio = np.asarray(audio, dtype=np.float32)
+
+        # 建立錨定：首次該 role 的輸出夠長（≥0.5s）才拿來當聲線參考，避免用過短片段。
+        if pending_anchor_role is not None and len(audio) >= int(self.sample_rate * 0.5):
+            self._anchor_voice(pending_anchor_role, audio, text)
+
+        return audio
+
+    def _anchor_voice(self, role: str, audio: np.ndarray, text: str) -> None:
+        """用一段合成輸出建立可重用的 VoiceClonePrompt，固定該 role 之後的聲線。"""
+        try:
+            import torch
+            prompt = self.model.create_voice_clone_prompt(
+                ref_audio=(torch.from_numpy(np.ascontiguousarray(audio)), self.sample_rate),
+                ref_text=text,
+            )
+            self._voice_anchors[role] = prompt
+            logger.info("已錨定 %s 聲線（來源句長 %.1fs）", role, len(audio) / self.sample_rate)
+        except Exception as e:
+            logger.warning("錨定 %s 聲線失敗（後續仍會重試）: %s", role, e)

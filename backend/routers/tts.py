@@ -51,6 +51,17 @@ async def patch_tts_settings(patch: dict):
         raise HTTPException(status_code=422, detail=str(e))
 
 
+@router.post("/voice/reset")
+async def reset_voice(request: Request):
+    """清除自我錨定的旁白/對白聲線，下次合成重新隨機取聲。"""
+    backend = getattr(request.app.state, "tts", None)
+    engine = getattr(backend, "_engine", backend)
+    if engine and hasattr(engine, "reset_voice_anchors"):
+        engine.reset_voice_anchors()
+        return {"status": "ok"}
+    return {"status": "noop"}
+
+
 class SpeechRequest(BaseModel):
     """單次語音合成請求（REST API 用）"""
     input: str
