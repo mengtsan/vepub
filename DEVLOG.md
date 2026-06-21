@@ -2,6 +2,58 @@
 
 ---
 
+## 2026-06-21 — TTS/OmniVoice 落地：模型目錄統一、registry 整併、粵語發音修復、優先語系設定
+
+以「模型目錄是否合理」為起點，一路延伸到 TTS 實裝與發音修錯。核心是把散落的模型路徑收斂成 `models/<category>/` 分類佈局，並讓 TTS 真正納入統一的 registry 管理。
+
+### 1. 模型目錄分類佈局與清理
+
+- **磁碟實況盤點**：模型已按類別分到 `models/{llm,image,tts,embeddings,ip_adapters,loras}/`；`.zimage_cache/` 是 Z-Image 的共用元件（text_encoder/tokenizer/vae，`pipelines.py` 下載時刻意 `ignore_patterns=["transformer/*"]`），transformer 主權重才放 `models/image/`。
+- **FaceID LoRA 路徑錯位（靜默 bug）**：`pipelines.py:257` 期待 `models/ip_adapters/ip-adapter-faceid_sdxl_lora.safetensors`，但檔案實際在 `models/loras/`，因 `os.path.isfile` 守門而**安靜跳過從未載入**。已把檔案移到 `ip_adapters/`。
+- **registry 幽靈條目**：`model_registry.json` 移除磁碟上不存在的 `kodoranime_v101`、`zimageturbonsfw_90bf16fp8`。
+- **.gitignore**：補上 `models/{ip_adapters,loras,embeddings}/`、`models/.cache/`（含 GB 級大檔，原本沒擋）。
+
+### 2. TTS 路徑三套打架 → 統一 `models/tts/`
+
+`model_registry.py`、`models_manager.py`、`downloader._CATEGORY_SUBDIR` 三處對 OmniVoice 該放哪各執一詞（頂層 `k2-fsa--OmniVoice` / `Serveurperso--OmniVoice-GGUF` / `models/tts/`）。趁磁碟上尚無 TTS 檔，全部統一到 `models/tts/`（`models_manager` 加 `TTS_DIR`/`GGUF_DIR` 常數消除三處重複字串；registry 偵測路徑同步）。
+
+### 3. OmniVoice 實裝 + 對照官方 API 的兩個 bug
+
+下載 `k2-fsa/OmniVoice`（0.6B，model.safetensors 2.45GB）到 `models/tts/k2-fsa--OmniVoice`。Introspect 已安裝套件的真實 `generate` 簽名，發現 `tts_engine._synthesize_sync` 兩個缺陷：
+
+- **`num_step` 是 no-op**：它不是 `generate()` 頂層參數，被 `**kwargs` 吞掉。改走 `OmniVoiceGenerationConfig(num_step=…)`。
+- **回傳是 `list[np.ndarray]`**：原本 `np.array(audio)` 會包成 `(1,T)`，改取 `audio[0]`。
+
+冒煙測試實機合成通過（24kHz、2.18s）。
+
+### 4. 模型管理徹底統一（方案 B）：models_manager 退場
+
+現況其實有三層，TTS 跑在 fallback 上：`routers/models.py`+`model_registry` 是活躍的統一管理層，但 registry 的 `tts.models` 是空的（`scan_local_models` 只掃 llm/image），導致 `build_active_tts()` 回 None → 落到 `main.py` fallback → 靠 `models_manager` 硬編碼路徑。而 `models_manager.py`（~400 行：MODEL_CONFIGS/DB 設定/GGUF/下載執行緒）**已無任何 router 引用**，只剩 `tts_engine` import。
+
+- `scan_local_models()` 新增 TTS 偵測，啟動時自動登錄 OmniVoice 並設 active。
+- `TTSEngine.__init__` 改收 `local_path`（來自 registry），新增 `_resolve_model_source()`；切斷對 `models_manager` 的依賴；刪除死碼 `load_specific`/`_load_specific_sync` 與 `model_id` 追蹤。
+- `_build_tts_backend(_raw)` 把 registry 的 `local_path` 傳進引擎。
+- **刪除 `services/models_manager.py`**（git 追蹤，可還原）；無用的 GGUF 選項隨之消失。
+- 端到端測試：啟動→登錄→建 backend→本地載入→合成，全綠，TTS 走 registry 單一來源。
+
+### 5. 中文唸成粵語 → 根因與修復
+
+`generate()` 的 `language` 從未傳入 → 一律 `None` → OmniVoice 落入「語言不可知」自動偵測（`_resolve_language` 回 None）。中文與粵語共用漢字，模型有時誤判成粵語(`yue`)。官方 ID：普通話 `zh`(cmn, 111k hr) vs 粵語 `yue`(13k hr)。
+
+採「後端按字偵測」：新增 `detect_language()`（假名→`ja`、諺文→`ko`、漢字→`zh`、拉丁→`en`；**先驗假名後驗漢字**，否則日文被當中文）。把 `language` 接線貫穿 4 層（engine→`tts_omnivoice` 包裝層→`/speech`→WS），**順手修好包裝層原本把 `num_step`/`duration` 丟棄的問題**。
+
+### 6. 優先手動語系設定
+
+新增 `services/tts_settings.py`（沿用 `llm_settings` 樣板，持久化到 `tts_settings.json`）與 `GET/PATCH /v1/audio/settings`。決議優先序：**單次請求 language ＞ 全域 `forced_language` ＞ 自動偵測**；`forced_language` 設 `null`/`"auto"` 即恢復偵測。
+
+### 驗證
+
+- 各檔 `ast.parse` 通過；ruff 零新增問題（剩餘 I001 為既有 in-function import 排序）。
+- `detect_language` 5/5；三層優先序（偵測 zh / 強制 en / 請求 ja）；設定持久化重載；全鏈路經 `OmniVoiceBackend` 合成出聲——皆通過。
+- **未跑前端**：語系下拉 UI 尚未做（後端不傳即自動偵測，可不阻塞）。
+
+---
+
 ## 2026-06-21 — 模型管理大整理：常用參數收斂、輔助模型、單一模型模式、架構偵測，與 Turbo 步數 bug
 
 一整輪以「模型設定」為核心的整理與修錯，貫穿後端 routing 與前端 ModelManager / 閱讀器設定面板。

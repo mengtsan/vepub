@@ -1,7 +1,15 @@
 {
   "tts": {
-    "active": null,
-    "models": {}
+    "active": "omnivoice",
+    "models": {
+      "omnivoice": {
+        "name": "OmniVoice",
+        "type": "omnivoice",
+        "local_path": "C:\\Users\\holy_\\Downloads\\vepub\\backend\\models\\tts\\k2-fsa--OmniVoice",
+        "size_bytes": 3267471724,
+        "source": "hf:k2-fsa/OmniVoice"
+      }
+    }
   },
   "image": {
     "active": "luciddreamerz_v0777azit.safetensors",
@@ -14,14 +22,6 @@
         "source": "",
         "style": "anime"
       },
-      "kodoranime_v101.safetensors": {
-        "name": "kodoranime_v101.safetensors",
-        "type": "diffusers",
-        "local_path": "C:\\Users\\holy_\\Downloads\\vepub\\backend\\models\\image\\kodoranime_v101.safetensors",
-        "size_bytes": 6938041924,
-        "source": "",
-        "style": "anime"
-      },
       "luciddreamerz_v0777azit.safetensors": {
         "name": "luciddreamerZ_v0777AZit.safetensors",
         "type": "diffusers",
@@ -29,14 +29,6 @@
         "size_bytes": 6155008632,
         "source": "",
         "style": "anime"
-      },
-      "zimageturbonsfw_90bf16fp8.safetensors": {
-        "name": "zImageTurboNSFW_90BF16FP8.safetensors",
-        "type": "diffusers",
-        "local_path": "C:\\Users\\holy_\\Downloads\\vepub\\backend\\models\\image\\zImageTurboNSFW_90BF16FP8.safetensors",
-        "size_bytes": 6155014840,
-        "source": "",
-        "style": "real"
       },
       "miaomiaoharem_v20.safetensors": {
         "name": "miaomiaoHarem_v20.safetensors",

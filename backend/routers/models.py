@@ -274,7 +274,7 @@ def _build_tts_backend(model_id: str, info: dict, request: Request):
         from services.tts_engine import TTSEngine
         hw = getattr(request.app.state, "hardware", {})
         device = hw.get("recommended_device", "cpu")
-        engine = TTSEngine(device=device)
+        engine = TTSEngine(device=device, local_path=local_path)
         b = OmniVoiceBackend(engine)
         b.model_id = model_id
         return b
@@ -319,7 +319,7 @@ def _build_tts_backend_raw(model_id: str, info: dict, app_or_state):
     if model_type == "omnivoice":
         from services.backends.tts_omnivoice import OmniVoiceBackend
         from services.tts_engine import TTSEngine
-        engine = TTSEngine(device=device)
+        engine = TTSEngine(device=device, local_path=local_path)
         b = OmniVoiceBackend(engine)
         b.model_id = model_id
         return b

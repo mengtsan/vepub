@@ -15,11 +15,15 @@ llama_bin/
 # HuggingFace 模型 config 快取（本機自動下載，勿 commit）
 .wan_cache/
 .zimage_cache/
+models/.cache/
 
-# 下載的模型檔案
+# 下載的模型檔案與輔助資產（皆為大檔，勿 commit）
 models/image/
 models/llm/
 models/tts/
+models/ip_adapters/
+models/loras/
+models/embeddings/
 
 # API tokens / credentials
 civitai_token.json

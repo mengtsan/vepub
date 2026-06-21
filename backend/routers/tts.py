@@ -8,7 +8,8 @@ WebSocket 協定（客戶端 → 伺服器）：
   合成請求：
     { "text": "...", "sentence_index": 0, "speed": 1.0,
       "ref_audio_path": null, "ref_text": null, "instruct": null,
-      "duration": null, "num_step": 32, "request_id": "1" }
+      "duration": null, "num_step": 32, "language": null, "request_id": "1" }
+    （language 省略時後端依文字內容自動偵測：漢字→'zh'、假名→'ja'、拉丁→'en'）
   取消請求：
     { "type": "cancel" }
 
@@ -25,13 +26,29 @@ import logging
 import io
 import wave
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from services.tts_engine import TTSEngine
+from services.tts_settings import get_settings, update_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+@router.get("/settings")
+async def get_tts_settings():
+    """取得 TTS 全域設定（目前含優先手動語系 forced_language）。"""
+    return get_settings().model_dump()
+
+
+@router.patch("/settings")
+async def patch_tts_settings(patch: dict):
+    """更新 TTS 全域設定。forced_language 設為 null/'auto' 即恢復自動偵測。"""
+    try:
+        return update_settings(patch).model_dump()
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 class SpeechRequest(BaseModel):
@@ -44,6 +61,7 @@ class SpeechRequest(BaseModel):
     instruct: str | None = None
     duration: float | None = None
     num_step: int = 32
+    language: str | None = None   # None = 後端依文字內容自動偵測（中文→'zh'）
 
 
 @router.post("/speech")
@@ -59,6 +77,7 @@ async def create_speech(req: SpeechRequest, request: Request):
         speed=req.speed,
         duration=req.duration,
         num_step=req.num_step,
+        language=req.language,
     ):
         chunks.append(chunk)
     audio_bytes = b"".join(chunks)
@@ -120,6 +139,7 @@ async def audio_stream(websocket: WebSocket):
                 instruct      = data.get("instruct") or None
                 duration      = data.get("duration") or None
                 num_step      = int(data.get("num_step", 32))
+                language      = data.get("language") or None
 
                 logger.debug("合成 index=%d request_id=%s text='%s'",
                              sentence_index, request_id, text[:20])
@@ -141,6 +161,7 @@ async def audio_stream(websocket: WebSocket):
                         speed=speed,
                         duration=duration,
                         num_step=num_step,
+                        language=language,
                     ):
                         if cancel_event.is_set():
                             cancelled = True

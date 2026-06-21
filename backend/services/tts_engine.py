@@ -1,8 +1,11 @@
 """
 OmniVoice TTS 引擎封裝。
 支援三種後端：mlx / cuda / cpu
-對外暴露統一的 synthesize_stream() 非同步產生器。
-新增 load_specific() 與 unload() 支援執行期間動態切換模型。
+對外暴露統一的 synthesize_stream() 非同步產生器與 load() / unload()。
+
+模型權重來源由建構時的 local_path 決定（來自 model_registry 的 local_path）；
+模型切換在 backend 層完成（router 重建 OmniVoiceBackend），引擎本身不持有模型 ID。
+
 完整支援 OmniVoice 官方三種推理模式：
   - Voice Cloning（聲音複製）：ref_audio + 選填 ref_text
   - Voice Design（聲音設計）：instruct 自然語言描述
@@ -10,19 +13,47 @@ OmniVoice TTS 引擎封裝。
 """
 import asyncio
 import logging
+import re
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# 字元區段 → OmniVoice 語言 ID。用於在呼叫端未指定 language 時依文字內容判斷，
+# 避免漢字在「語言不可知」模式下被誤判成粵語(yue)等方言。
+_RE_KANA   = re.compile(r"[぀-ゟ゠-ヿ]")  # 平假名 / 片假名 → 日文
+_RE_HANGUL = re.compile(r"[가-힣]")               # 諺文 → 韓文
+_RE_HAN    = re.compile(r"[一-鿿㐀-䶿]")  # 漢字 → 中文(普通話)
+_RE_LATIN  = re.compile(r"[A-Za-z]")
+
+
+def detect_language(text: str) -> str | None:
+    """依文字內容粗略判斷 OmniVoice 語言 ID；無法判斷時回傳 None（交模型自動偵測）。
+
+    順序很重要：日文同時含假名與漢字，必須先驗假名，否則會被當成中文。
+    """
+    if not text:
+        return None
+    if _RE_KANA.search(text):
+        return "ja"
+    if _RE_HANGUL.search(text):
+        return "ko"
+    if _RE_HAN.search(text):
+        return "zh"      # 普通話（111k hr 訓練），明確指定避免落入粵語
+    if _RE_LATIN.search(text):
+        return "en"
+    return None
+
 
 class TTSEngine:
-    def __init__(self, device: str = "auto"):
+    def __init__(self, device: str = "auto", local_path: str | None = None):
         self.device = device
+        # 模型權重所在本地目錄（由 registry 的 local_path 傳入）；
+        # 為 None 或不完整時退回 HF repo id，由 huggingface_hub 自動處理快取。
+        self.local_path = local_path
         self.model = None
         self.sample_rate = 24000
         self._lock = asyncio.Lock()
-        # 記錄目前已載入的模型 ID，供 /status 顯示使用
-        self._loaded_model_id: str | None = None
 
     async def load(self):
         """
@@ -45,65 +76,42 @@ class TTSEngine:
         else:
             self._load_torch()
 
+    def _resolve_model_source(self) -> str:
+        """決定模型載入來源：本地目錄完整則用之，否則退回 HF repo id（自動快取）。"""
+        import os
+        from pathlib import Path
+
+        if self.local_path \
+           and os.path.exists(os.path.join(self.local_path, "config.json")) \
+           and os.path.exists(os.path.join(self.local_path, "model.safetensors")):
+            src = Path(self.local_path).as_posix()
+            logger.info("自本地目錄載入 OmniVoice: %s", src)
+            return src
+
+        logger.info("本地未偵測到完整權重，改用 HF repo（自動快取）: k2-fsa/OmniVoice")
+        return "k2-fsa/OmniVoice"
+
     def _load_torch(self):
         """
         載入 PyTorch 版本模型（適用於 CUDA 與 CPU）
         """
         import torch
         from omnivoice import OmniVoice
-        from services.models_manager import get_current_model_id, MODEL_CONFIGS, set_engine_loaded_model_id
-        from pathlib import Path
 
         device_map = "cuda:0" if self.device == "cuda" else "cpu"
         dtype = torch.float16 if self.device == "cuda" else torch.float32
 
-        model_id = get_current_model_id()
-        model_source = "k2-fsa/OmniVoice"
-
-        # 只有在本地專案目錄確實有模型檔案時才自本地載入，否則使用 repo_id 讓 Hugging Face 自動處理快取
-        import os
-        local_dir = MODEL_CONFIGS["official"]["local_dir"]
-        if os.path.exists(os.path.join(local_dir, "config.json")) and \
-           os.path.exists(os.path.join(local_dir, "model.safetensors")):
-            model_source = Path(local_dir).as_posix()
-            logger.info("自本地專案目錄載入官方模型: %s", model_source)
-        else:
-            logger.info("本地專案目錄未偵測到模型，自預設路徑載入 (Hugging Face 自動處理快取): %s", model_source)
-
-        if model_id != "official":
-            logger.info("已選取量化模型 %s（以官方 PyTorch 作為推理相容核心）", model_id)
-
         self.model = OmniVoice.from_pretrained(
-            model_source,
+            self._resolve_model_source(),
             device_map=device_map,
             dtype=dtype,
         )
-        self._loaded_model_id = model_id
-        # 同步更新 models_manager 的全域載入狀態
-        set_engine_loaded_model_id(model_id)
 
     def _load_mlx(self):
         """
         載入 MLX 版本模型（適用於 Apple Silicon）
         """
-        from services.models_manager import get_current_model_id, MODEL_CONFIGS, set_engine_loaded_model_id
-        from pathlib import Path
-        import os
-
-        model_id = get_current_model_id()
-        model_source = "k2-fsa/OmniVoice"
-
-        local_dir = MODEL_CONFIGS["official"]["local_dir"]
-        if os.path.exists(os.path.join(local_dir, "config.json")) and \
-           os.path.exists(os.path.join(local_dir, "model.safetensors")):
-            model_source = Path(local_dir).as_posix()
-            logger.info("自本地專案目錄載入 MLX 模型: %s", model_source)
-        else:
-            logger.info("本地專案目錄未偵測到模型，自預設路徑載入 MLX 模型: %s", model_source)
-
-        if model_id != "official":
-            logger.info("已選取量化模型 %s（以官方 MLX/MPS 作為推理相容核心）", model_id)
-
+        model_source = self._resolve_model_source()
         try:
             from omnivoice_mlx import OmniVoiceMLX
             self.model = OmniVoiceMLX.from_pretrained(model_source)
@@ -117,48 +125,14 @@ class TTSEngine:
                 dtype=torch.float16,
             )
 
-        self._loaded_model_id = model_id
-        set_engine_loaded_model_id(model_id)
-
-    async def load_specific(self, model_id: str):
-        """
-        動態切換並載入指定的模型 ID（官方或量化版）。
-        會先卸載現有模型以釋放記憶體，再重新載入。
-        此操作為長時間阻塞操作，需在執行緒池中執行。
-        """
-        from services.gpu_manager import gpu_manager
-        await gpu_manager.acquire_gpu('tts')
-        try:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._load_specific_sync, model_id)
-        finally:
-            gpu_manager.release_gpu()
-
-    def _load_specific_sync(self, model_id: str):
-        """
-        同步切換模型的內部實作。
-        """
-        from services.models_manager import set_current_model_id
-
-        # 更新資料庫中的選取模型設定
-        set_current_model_id(model_id)
-
-        # 先釋放現有模型記憶體
-        self._unload_model_memory()
-
-        # 重新載入（_load_sync 會自動讀取 get_current_model_id() 的設定）
-        self._load_sync()
-        logger.info("已成功切換並載入模型: %s", model_id)
-
     def _unload_model_memory(self):
         """
         釋放目前已載入的模型記憶體資源。
         """
         import gc
-        from services.models_manager import set_engine_loaded_model_id
 
         if self.model is not None:
-            logger.info("正在卸載模型: %s", self._loaded_model_id)
+            logger.info("正在卸載 TTS 模型")
             # 嘗試呼叫模型自身的釋放方法（若有）
             if hasattr(self.model, "cpu"):
                 try:
@@ -177,8 +151,6 @@ class TTSEngine:
             except Exception:
                 pass
 
-        self._loaded_model_id = None
-        set_engine_loaded_model_id("")  # "" = 明確卸載，區別於 None（啟動預設）
         logger.info("模型已從記憶體中卸載")
 
     async def unload(self):
@@ -203,6 +175,7 @@ class TTSEngine:
         speed: float = 1.0,
         duration: float | None = None,
         num_step: int = 32,
+        language: str | None = None,
     ):
         """
         非同步產生 PCM 位元組（int16, 24kHz, 單聲道）。
@@ -235,7 +208,7 @@ class TTSEngine:
                 audio_np = await loop.run_in_executor(
                     None,
                     self._synthesize_sync,
-                    text, ref_audio_path, ref_text, instruct, speed, duration, num_step
+                    text, ref_audio_path, ref_text, instruct, speed, duration, num_step, language
                 )
         finally:
             gpu_manager.release_gpu()
@@ -258,15 +231,34 @@ class TTSEngine:
         speed: float,
         duration: float | None,
         num_step: int,
+        language: str | None = None,
     ) -> np.ndarray:
         """
         呼叫模型進行語音合成的同步實作，回傳 numpy float32 陣列。
         根據提供的參數自動決定使用 Voice Cloning / Voice Design / Auto 模式。
         """
+        from omnivoice.models.omnivoice import OmniVoiceGenerationConfig
+
+        # num_step 屬於 generation_config，並非 generate() 的頂層參數；
+        # 直接以 num_step= 傳入會被 **kwargs 吞掉而完全無效。
         kwargs: dict = {
             "text": text,
-            "num_step": num_step,
+            "generation_config": OmniVoiceGenerationConfig(num_step=num_step),
         }
+
+        # 語言決議優先序：單次請求 language ＞ 全域強制語系 ＞ 文字內容自動偵測。
+        # None 會落入模型「語言不可知」模式，漢字可能被誤判成粵語(yue)，故中文須明確帶 'zh'。
+        from services.tts_settings import get_forced_language
+        forced = get_forced_language()
+        if language:
+            lang, src = language, "請求指定"
+        elif forced:
+            lang, src = forced, "全域強制"
+        else:
+            lang, src = detect_language(text), "自動偵測"
+        if lang:
+            kwargs["language"] = lang
+            logger.debug("語言: %s（%s）", lang, src)
 
         # Voice Cloning 模式：提供參考音訊
         if ref_audio_path:
@@ -290,9 +282,14 @@ class TTSEngine:
         else:
             kwargs["speed"] = speed
 
+        # generate() 回傳 list[np.ndarray]（每個元素對應一句輸入文字）。
+        # 單句合成只取第一個元素，避免被包成 (1, T) 形狀。
         audio = self.model.generate(**kwargs)
+
+        if isinstance(audio, (list, tuple)):
+            audio = audio[0] if audio else np.zeros(0, dtype=np.float32)
 
         # 確保回傳 numpy float32 陣列
         if hasattr(audio, "numpy"):
-            return audio.numpy()
-        return np.array(audio, dtype=np.float32)
+            audio = audio.numpy()
+        return np.asarray(audio, dtype=np.float32)

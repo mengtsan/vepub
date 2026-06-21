@@ -28,6 +28,9 @@ class OmniVoiceBackend:
         ref_text: str | None = None,
         instruct: str | None = None,
         speed: float = 1.0,
+        duration: float | None = None,
+        num_step: int = 32,
+        language: str | None = None,
         **kwargs,
     ):
         async for chunk in self._engine.synthesize_stream(
@@ -36,5 +39,8 @@ class OmniVoiceBackend:
             ref_text=ref_text,
             instruct=instruct,
             speed=speed,
+            duration=duration,
+            num_step=num_step,
+            language=language,
         ):
             yield chunk

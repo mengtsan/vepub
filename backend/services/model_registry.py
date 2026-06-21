@@ -69,8 +69,8 @@ def _build_default() -> dict:
     chat_id = llm_id
     analysis_id = llm_id
 
-    # 偵測現有 TTS 本地目錄
-    tts_local = os.path.join(_MODELS_DIR, "k2-fsa--OmniVoice")
+    # 偵測現有 TTS 本地目錄（統一在 models/tts/ 下，與 llm/、image/ 一致）
+    tts_local = os.path.join(_MODELS_DIR, "tts", "k2-fsa--OmniVoice")
     tts_models: dict = {}
     if os.path.isdir(tts_local):
         sz = sum(
@@ -231,10 +231,34 @@ def patch_model_info(category: str, model_id: str, patch: dict) -> dict:
 
 
 def scan_local_models() -> int:
-    """掃描 models/image/ 與 models/llm/ 子目錄，自動登錄尚未在 registry 的模型檔案。
+    """掃描 models/{tts,image,llm}/ 子目錄，自動登錄尚未在 registry 的模型檔案。
     回傳新增模型數量。"""
     reg = _load()
     added = 0
+
+    # TTS：OmniVoice 為 snapshot 目錄（非單檔），偵測 config.json + model.safetensors
+    tts_local = os.path.join(_MODELS_DIR, "tts", "k2-fsa--OmniVoice")
+    if os.path.exists(os.path.join(tts_local, "config.json")) \
+       and os.path.exists(os.path.join(tts_local, "model.safetensors")):
+        tts_models = reg.setdefault("tts", {}).setdefault("models", {})
+        if "omnivoice" not in tts_models:
+            sz = sum(
+                os.path.getsize(os.path.join(dp, f))
+                for dp, _, files in os.walk(tts_local)
+                for f in files
+            )
+            tts_models["omnivoice"] = {
+                "name": "OmniVoice",
+                "type": "omnivoice",
+                "local_path": tts_local,
+                "size_bytes": sz,
+                "source": "hf:k2-fsa/OmniVoice",
+            }
+            # 首次登錄即設為 active
+            if not reg["tts"].get("active"):
+                reg["tts"]["active"] = "omnivoice"
+            added += 1
+            print("[registry] 自動登錄 TTS 模型: OmniVoice")
 
     image_dir = os.path.join(_MODELS_DIR, "image")
     if os.path.isdir(image_dir):
